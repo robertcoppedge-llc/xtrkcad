@@ -1,6 +1,19 @@
-# XTrkCAD Build Status - 8/15/2026
+# XTrkCAD Build Status - 8/17/2026
 
 ## Current Status: PARTIALLY SETUP - NEEDS CLEAN SLATE
+
+### Successfully Installed (Linux/Ubuntu):
+- ✅ CMake (via apt)
+- ✅ GTK+ 2.0 (`libgtk2.0-dev`)
+- ✅ Zlib (`zlib1g-dev`)
+- ✅ Libzip (`libzip-dev`)
+- ✅ Gettext (`gettext`)
+- ✅ MiniXML (`libmxml-dev`)
+- ✅ CMocka (`libcmocka-dev`)
+- ✅ Doxygen (`doxygen`)
+- ✅ Pandoc (`pandoc`)
+- ✅ FreeImage (`libfreeimage-dev`)
+- ✅ Libxml2 (`libxml2-dev`)
 
 ### Successfully Installed (via winget):
 - ✅ CMake 4.4.2 at `C:\Program Files\CMake\bin\cmake.exe`
