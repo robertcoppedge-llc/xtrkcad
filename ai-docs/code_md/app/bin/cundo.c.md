@@ -1,185 +1,194 @@
-# cundo.c — Undo/Redo System with Extra Data Support
+# cundo.c — Undo/Redo System
 
 ## Overview
 
-`cundo.c` implements a **ring-buffer undo/redo system** for XTrkCad that integrates with the extra data storage framework. Each track can hold arbitrary typed data (via `extraDataBase_t`) and all modifications to those fields are automatically recorded in the undo stream, enabling full-featured undo/redo even when changing custom properties like motor names or turnout configurations.
+`cundo.c` implements XTrkCad's **undo/redo** system, enabling users to revert changes by restoring previously saved snapshots of tracks and other objects. The design is a classic "transactional" approach: each modification operation (create, modify, delete) records its effect in an expandable ring buffer (`undoStream`), which can be replayed when `Undo()` is invoked.
+
+Key architectural decisions:
+- **Two streams**: `undoStream` holds the history of changes; `redoStream` holds the inverse operations for redo.
+- **Circular buffer with wrap-around handling**: When a new transaction begins, old entries are recycled after their undo records have been processed (deleting freed tracks).
+- **Defer-free mechanism**: For compound objects containing embedded pointers (e.g., title strings), the old memory is not immediately freed but held in `deferFree_da` until the undo stack entry is expired. This prevents use-after-free bugs when an object's fields are restored during undo.
 
 ---
 
-## Core Design: Circular Transaction Stack + Expandable Streams
+## Key Data Structures
 
-### The Undo Stack (`undoStack[]`)
-
-A circular buffer of 10 `undoStack_t` entries (configurable by `UNDO_STACK_SIZE`). Each entry tracks a transaction boundary:
+### `undoStack_t` — Transaction Entry
 
 ```c
 typedef struct {
-    wIndex_t modCnt;      // Number of ModifyOp records in this transaction
-    wIndex_t newCnt;      // Number of New tracks added since last UndoStart()
-    wIndex_t delCnt;      // Number of DeleteOp records (for freeing deleted objects)
-    wIndex_t trackCount;  // Total number of tracks when transaction started
-    track_p newTrks;      // Head of list of newly created tracks in this transaction
-    uintptr_t undoStart;  // Byte offset where this transaction's records begin in the stream
-    uintptr_t undoEnd;    // End marker for this transaction in the stream
-    uintptr_t redoStart;  // Where redo records would start (cleared on new UndoStart)
-    uintptr_t redoEnd;    // Redo end marker
-    BOOL_T needRedo;      // TRUE if there are redoable operations available
-    track_p *oldTail;     // Pointer to old tail for splice operation during undo
-    track_p *newTail;     // Pointer to new tail of modified tracks
-    char *label;          // Human-readable label (e.g., "Change Track Name")
-    dynArr_t deferFree_da;// Tracks that should be freed after this transaction is recycled
+    wIndex_t modCnt;       // Number of ModifyOp records written to stream
+    wIndex_t newCnt;       // Number of New tracks added in this transaction
+    wIndex_t delCnt;       // Number of DeleteOp records
+    wIndex_t trackCount;   // Snapshot: total number of tracks at start
+
+    track_p newTrks;      // Linked list of newly created tracks (not yet linked)
+
+    uintptr_t undoStart;  // Pointer into undoStream where this transaction starts
+    uintptr_t undoEnd;    // Pointer marking the end of recorded operations
+
+    uintptr_t redoStart;  // Pointer into redoStream for this entry's inverse ops
+    uintptr_t redoEnd;    // End marker in redoStream
+
+    BOOL_T needRedo;      // Flag: has this transaction been undone? (has it been replayed into redo?)
+
+    track_p *oldTail;     // Pointer to last track pointer before unlinking new tracks
+    track_p *newTail;     // Pointer to the tail of newly created tracks list
+
+    char *label;          // Balloon help text: "Create Track", "Move Track", etc.
+
+    dynArr_t deferFree_da;// List of memory blocks that must not be freed until this entry expires
 } undoStack_t, *undoStack_p;
 ```
 
-### The Streams (`undoStream`, `redoStream`)
+### `stream_t` — Expandable Ring Buffer
 
-Both are expandable ring buffers implemented as a dynamic array of `streamBlocks_t` (8KB blocks each). They store serialized track records:
-- Operation type (`ModifyOp` = 1 or `DeleteOp` = 2)
-- Pointer to the original track object
-- Full copy of the track structure
-- Endpoints and extra data at the time of modification
-
-The stream grows by allocating new blocks from a dynamic array, allowing indefinite growth (limited only by available memory). When the undo transaction wraps around its circular buffer, `TrimStream()` purges unreferenced old blocks.
-
----
-
-## Key Functions
-
-### `UndoStart(char *label, char *undoDesc)`
-
-Begins a new undo transaction. Sets up:
-- Transaction label and description (for UI display)
-- Points to the current slot in the circular stack (`undoHead`)
-- Initializes counters for modifications/new tracks/deletions within this transaction
-- Clears redo state (`redoStart`, `needRedo` = FALSE)
-
-**Parameters:**
-- `label` — Short human-readable label (e.g., "Change Switch Motor")
-- `undoDesc` — Full description shown in the undo dialog
-
----
-
-### `UndoModify(track_p trk)`
-
-Marks a track modification within the current transaction. Calls `WriteObject()` to serialize:
-1. Operation type (`MODIFYOP`)
-2. The entire track pointer and its contents (including all extra data)
-3. A copy of any custom extra data stored via `StoreTrackData()`
-
-The modified track pointer is written into the undo stream for later restoration.
-
----
-
-### `UndoDelete(track_p trk)`
-
-Marks a track for deletion. Sets the `.delete` flag on the track structure and records it as a `DELETEOP` in the stream. When the transaction wraps around (is recycled), deleted tracks are freed via `FreeTrack()`.
-
----
-
-### `UndoEnd(void)`
-
-Finalizes the current transaction:
-- Writes final markers to the undo/redo streams
-- Marks all modified tracks with their respective tail pointers for splice operations
-- Calls `UndoClear()` if needed to reset state
-
----
-
-### `UndoNew(track_p trk)`
-
-Registers a newly created track. The new track is added to the transaction's linked list (`newTrks`) so that when undoing, it can be spliced out of the main track list (restoring the pre-new state).
-
----
-
-### `UndoFail(char *cause, uintptr_t val, char *file, int line)`
-
-An assertion-failure helper. When an internal invariant is violated (e.g., overrunning a stream buffer), it:
-1. Displays an error dialog to the user with file/line information
-2. Appends a detailed log dump to `undoTraceFile` (a text file in the working directory) containing:
-   - Current stack state for all 10 circular entries
-   - Stream contents as hex dumps
-   - Record buffer content
-3. Calls `UndoClear()` and returns `FALSE`
-
----
-
-### `Rprintf(char *format, ...)`
-
-A custom logging function that buffers formatted messages in a rotating ring buffer (8KB). When full, it flushes to stdout or stderr. Used for debugging undo stream contents.
-
----
-
-### `ReadStream(stream_p s, void *ptr, int size)` / `WriteStream(stream_p s, void *ptr, int size)`
-
-Low-level block-oriented I/O:
-- **WriteStream**: Copies data into the current stream buffer. If the last block is full, allocates a new one and appends it to the dynamic array (`stream_da`). Handles partial writes across block boundaries.
-- **ReadStream**: Reads from the stream at `curr`, advancing the cursor forward. Uses internal assertions (`UASSERT`) to detect overruns.
-
-Both functions use zero-copy when possible (direct memory copy) but ensure proper alignment and block boundary handling.
-
----
-
-### `TrimStream(stream_p s, uintptr_t off)` / `TruncateStream(stream_p s, uintptr_t off)`
-
-- **TrimStream**: Removes blocks from the *beginning* of the stream (oldest records). Used when a transaction wraps around — its old records are no longer referenced and can be freed.
-- **TruncateStream**: Shortens the stream at a given byte offset. Used to shrink the undo/redo buffers when they grow beyond necessary size.
-
----
-
-## Extra Data Integration
-
-The undo system integrates with the extra data framework (`custom.c`):
+A dynamically allocated ring buffer built from linked blocks:
 
 ```c
-static void StoreTrackData(track_p trk, void **buff, long *len)
-{
-    // Serialize all extra data fields of this track into a buffer
-}
+#define BSTREAM_SIZE (4096)  // Each block holds 4KB of record data
+
+typedef struct {
+    dynArr_t stream_da;   // Array of `streamBlocks_p` pointers
+    long startBInx;       // Logical start index into the array
+    uintptr_t end;        // Absolute offset (byte count from beginning) marking write boundary
+    uintptr_t curr;       // Current write position
+} stream_t;
 ```
 
-When `UndoModify()` is called after changing an extra field (e.g., renaming a switch motor), the entire track including its embedded extra data is copied to the undo stream. On redo, the original state is restored by deserializing from the stored copy.
+Records are written sequentially. When `end` reaches the array limit, new blocks are appended via dynamic allocation (`dynArr_append`). This avoids circular buffer modulo arithmetic and keeps memory layout simple.
 
 ---
 
-## Circular Stack Mechanics
+## Core Functions
 
-The 10-entry stack operates as follows:
+### `UndoStart(char * label, char * format)` — Begin a Transaction
 
-| Scenario | Behavior |
-|----------|----------|
-| `undoHead` points to a valid slot with active transaction | Operations recorded in that slot's counters |
-| Transaction completes (`UndoEnd()`) | Increment `undoHead`; if it wraps past `UNDO_STACK_SIZE-1`, reset to 0 and call `DeleteInStream()` for the old slot |
-| `DeleteInStream(undoStack_p us)` | Iterates over all DeleteOp records in that transaction's stream range, freeing each deleted track. The entire undo block is then freed. |
-
-This design ensures memory is reclaimed when older transactions are no longer needed while maintaining a bounded maximum footprint (10 × sizeof(`undoStack_t`) + stream blocks).
-
----
-
-## Related Files
-
-| File | Purpose |
-|------|---------|
-| `custom.c` / `custom.h` | Extra data storage framework (`StoreTrackData`, etc.) |
-| `trackx.h` | Track list management (splicing new/deleted tracks in/out) |
-| `trkendpt.h` | End point structures used by the undo system |
-| `draw.h` | Drawing commands (used when reconstructing geometry on redo) |
-
----
-
-## Usage Pattern
+This is called by every command that modifies the track database:
 
 ```c
-UndoStart("Change Track Name", "Changed track name");
-    trk = FindTrackByName("Mainline");
-    if (!trk) { return; }
-    
-    // Modify a custom field
-    switchmotorData_p sm = GET_EXTRA_DATA(trk, T_SWITCHMOTOR, switchmotorData_t);
-    MyFree(sm->name);
-    sm->name = MyStrdup(newName);
-
-UndoModify(trk);
-UndoEnd();
+void UndoStart(
+    char   * label,      // Balloon help text (e.g., "Create Track")
+    char  * format,      // Log message with %d/%s placeholders
+    ...                  // Arguments for log formatting
+);
 ```
 
-This records the modification. On Undo, the original name pointer is restored from the undo stream and `MyFree()`'d. The track is re-linked into its proper position in the list.
+Behavior:
+1. Sets `undoActive = TRUE` and resets the current stack entry's counters (`modCnt`, `newCnt`, `delCnt`).
+2. If this is a *fresh* transaction (first since last undo), it unlinks all previously "New" tracks from the global track list at `to_first` → `to_last`.
+3. Calls `ClearStream(&redoStream)` — redo stream is purged for every new transaction.
+4. Sets `undoStack[undoHead].undoStart = undoStream.end`, preparing to write records.
+5. Increments `doCount` (number of active transactions).
+
+If the circular buffer wraps (`doCount == UNDO_STACK_SIZE`), it calls `DeleteInStream()` to unlink and free all tracks marked as deleted, then frees them from memory.
+
+---
+
+### `UndoModify(track_p trk)` — Record a Modified Track
+
+Called when a track is edited (attributes changed, segments modified). It:
+- Checks that the track has been flagged with `trk->modified = TRUE` by the caller.
+- Writes a record to `undoStream` containing the *entire* track object (`track_t`) plus its endpoint array and extra data block. The operation tag is `ModifyOp`.
+- Increments the current transaction's `modCnt`.
+
+---
+
+### `UndoDelete(track_p trk)` — Record a Deleted Track
+
+Called when a track is removed from the database:
+
+```c
+BOOL_T UndoDelete( track_p trk );
+```
+
+Logic:
+1. If the track was previously **Modified** in this transaction, it changes that record's op tag from `ModifyOp` to `DeleteOp`. The stored snapshot already contains the pre-deletion state — undoing will restore it as a modified object rather than re-creating it anew.
+2. If the track was *not* modified and is also not "New", writes a fresh `DeleteOp` record with the current track contents (for restoration).
+3. If the track **was New** (created in this transaction), simply removes it from the linked list at its insertion point (`newTrks`). No stream record is needed — the track was never fully committed to the database.
+
+After recording, sets `trk->deleted = TRUE` so other code branches can skip processing deleted tracks.
+
+---
+
+### `UndoNew(track_p trk)` — Record a Newly Created Track
+
+For tracks created in this transaction:
+- Sets `trk->new = TRUE`.
+- Links into the head of the current entry's `newTrks` list (via `us->newTrks`).
+
+This allows quick cleanup when wrapping around or aborting. The track remains linked at the tail (`to_last`) until undo is executed.
+
+---
+
+### `UndoEnd(void)` — Commit Transaction
+
+Called by every command after successfully completing its action:
+- Calls `AttachTrains()` if car attachments were modified during this transaction.
+- Calls `UpdateAllElevations()` to recompute track elevations (e.g., after pier modifications).
+- **Note:** It does *not* call the generic undo/redo UI — that is done by separate hotbar buttons or menu commands.
+
+---
+
+### `UndoUndo(void)` — Execute Undo
+
+The main undo operation:
+1. Decrement `doCount`, increment `undoCount`.
+2. Move to the previous stack entry (`DEC_UNDO_INX(undoHead)`).
+3. Re-link all "New" tracks into the global track list at their recorded insertion points.
+4. Read each record from `undoStream`:
+   - **ModifyOp**: Restore the modified track's state (replaces current with snapshot).
+   - **DeleteOp**: Restore a deleted track, relink it into the database.
+5. If a track was New and got deleted in this undo transaction, delete the old entry to avoid double-free.
+6. Call `UpdateAllElevations()` again if needed.
+
+---
+
+### `UndoRedo(void)` — Redo an Undone Transaction
+
+The inverse of Undo:
+1. Move forward in stack (`INC_UNDO_INX(undoHead)`).
+2. Read records from `redoStream` (which was populated by Undo) and replay them as modifications or creations.
+3. Re-link the "New" tracks that were previously restored during undo.
+
+---
+
+### `DeleteInStream(stream_p stream, uintptr_t start, uintptr_t end)` — Free Deleted Tracks
+
+When a transaction is recycled (stack wrap-around), this function:
+- Scans records from `start` to `end`.
+- For each record tagged with `op == DeleteOp`, frees the track object and decrements global track count.
+- The freed tracks are unlinked from the database and no longer referenced anywhere.
+
+---
+
+### `SetDeleteOpInStream(stream_p stream, uintptr_t start, uintptr_t end, track_p trk)` — Convert Modify → Delete
+
+Used when a track is deleted *after* it was modified in a transaction. Since the modification record already exists in `undoStream`, we must change its op tag from `ModifyOp` to `DeleteOp`. The stored snapshot is still valid — undoing will restore the pre-deletion state of that object.
+
+---
+
+### `UndoDeferFree(void * p)` — Postpone Freeing Embedded Memory
+
+For compound objects (e.g., structures with title strings, turnouts with pier names), the old memory holding the previous string value must not be freed immediately when a modification occurs. Instead:
+1. Store the pointer in `deferFree_da` of the current undo stack entry.
+2. When that entry is recycled, all pointers are walked and each block is freed exactly once.
+
+This prevents "double free" crashes where two different objects share the same string memory but only one expects it to be freed at a given time.
+
+---
+
+### `UndoResume()` / `UndoSuspend()` — Enable/Disable Recording
+
+These functions allow temporarily disabling undo recording (e.g., during certain initialization operations or batch imports). When suspended, modifications are not recorded and no stream entries are written.
+
+---
+
+## Summary
+
+| Aspect | Detail |
+|--------|--------|
+| Undo stack size | 10 entries (`UNDO_STACK_SIZE`) |
+| Stream block size | 4096 bytes (`BSTREAM_SIZE`), allocated dynamically as needed |
+| Operation types | `ModifyOp`, `DeleteOp`, and implicitly `New` (tracked via linked list) |
+| Memory safety | Defers freeing of embedded pointers until the entire transaction is expired; uses `IsTrackDeleted()` guards everywhere. |

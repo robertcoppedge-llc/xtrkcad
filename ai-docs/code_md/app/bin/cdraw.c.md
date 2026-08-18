@@ -1,200 +1,195 @@
-# cdraw.c — Drawing Primitives and Text Rendering
+# cdraw.c — Drawing of Geometric Elements (Track Segments)
 
 ## Overview
 
-`cdraw.c` implements the **drawing subsystem** for XTrkCad. It handles rendering of geometric elements (lines, polylines, filled regions), text labels with font management, and provides a modifier menu system for changing drawing style (solid lines, dashed lines, dots, center marks, phantom lines, etc.). The module also converts Bezier curve approximations into renderable polygon vertex arrays.
+`cdraw.c` is the core rendering and editing engine for XTrackCAD. It handles:
+
+- **Drawing track segments** (straights, curves, bezier arcs, polygons, text labels, benches, table edges)
+- **The description system** — a dialog-based UI that lets users edit any field of any segment (point coordinates, radius, angle, color, width, line style, fill state, layer, pivot point, etc.)
+- **Dynamic drawing of previews** during drag-and-drop operations
+- **Hit detection and distance queries** for snapping and selection
+
+The file defines a "segment" data structure that can represent any geometric primitive (line, arc, polyline, text, rectangle, bench, table edge) as well as compound objects like filled shapes. All drawing is done via GTK+ primitives (`gtk_draw_polygon`, `gtk_arc`, etc.).
 
 ---
 
-## Core Data Structure: `extraDataDraw_t`
+## Key Data Structures
+
+### `trkSeg_t` — A Track Segment
+
+A single segment record can represent:
+- A straight line (SEG_STRLIN, SEG_DIMLIN)
+- An arc (SEG_CRVLIN, SEG_CRVTRK)
+- A Bezier curve (SEG_BEZLIN, SEG_BEZTRK)
+- A polyline or filled polygon (SEG_POLY, SEG_FILPOLY)
+- Text (SEG_TEXT)
+- Bench data (SEG_BENCH)
+- Table edge (SEG_TBLEDGE)
+
+```c
+typedef struct {
+    char type;                          // SEG_STRLIN, SEG_CRVLIN, etc.
+    wIndex_t subType;                   // 0 = straight line, 1 = dimensioned
+    wDrawColor color;                   // Color index
+    LWIDTH_T lineWidth;                 // Stroke width in pixels (scaled)
+    unsigned int layer;                 // Layer ID for drawing order
+    BOOL_T masked;                      // TRUE if not shown on current scale
+    struct {                            // Union of actual geometry:
+        struct {                        // SEG_STRLIN / SEG_DIMLIN
+            coOrd pos[2];              // Start and end points
+        } l;
+        struct {                        // SEG_CRVLIN / SEG_CRVTRK
+            coOrd center;               // Center point
+            DIST_T radius;              // Radius (signed: + for CCW, - for CW)
+            ANGLE_T a0;                 // Start angle
+            ANGLE_T a1;                 // End angle
+        } c;
+        struct {                        // SEG_BEZLIN / SEG_BEZTRK
+            coOrd pos[2];              // First and last control points of the Bezier
+            dynArr_t bezSegs;          // Sub-segments (lines or arcs)
+        } b;
+        struct {                        // SEG_POLY / SEG_FILPOLY
+            int cnt;                    // Number of vertices
+            pts_t pts[1];              // Array of (x, y, type) tuples
+            enum wPolyType polyType;    // RECTANGLE, FREEFORM, etc.
+        } p;
+        struct {                        // SEG_TEXT
+            char *string;               // Text string
+            coOrd pos;                  // Origin point
+            ANGLE_T angle;              // Rotation
+            long fontSize;              // Font size (in points)
+        } t;
+        struct {                        // SEG_BENCH / SEG_TBLEDGE
+            struct benchData_s *bench;  // Pointer to bench definition data
+        } u;                           // Union for user-defined segment types
+    } u;
+} trkSeg_t, *trkSeg_p;
+```
+
+### `extraDataDraw_t` — Draw Object Extra Data (used with T_DRAW track type)
+
+A "draw" object is a collection of segments that share a common origin and angle transform. Used for placing multiple segments together as a group.
 
 ```c
 typedef struct extraDataDraw_t {
-    extraDataBase_t base;   // Shared undo/redo chain header + type ID
-    coOrd orig;             // Origin point (where the element is placed)
-    ANGLE_T angle;          // Rotation angle around origin
-    drawLineType_e lineType;// Line style: SOLID, DASHED, DOT, CENTER, PHANTOM, etc.
-    wIndex_t segCnt;        // Number of segments in this drawing object
-    trkSeg_t segs[1];       // Dynamic array head for segment data
-} extraDataDraw_t;
+    extraDataBase_t base;               // Generic header: index, layer, etc.
+    coOrd orig;                         // Transformation origin (x,y)
+    ANGLE_T angle;                      // Rotation around origin
+    drawLineType_e lineType;            // SOLID, DASHED, DOT, etc.
+    wIndex_t segCnt;                    // Number of segments in the group
+    trkSeg_t segs[1];                  // Variable-length array of segments
+} extraDataDraw_t, *extraDataDraw_p;
 ```
 
-This structure is attached to every drawn track (via `extraDataBase_p` pointer) and stores the full geometric description needed for rendering.
+### `drawDesc_e` — Description Field Enum
+
+Each field that can be edited via the description dialog has a corresponding enum value:
+
+| Value | Name | Purpose |
+|-------|------|---------|
+| E0 / E1 | End Pt 1/2 X,Y | Position of endpoint 0 or 1 |
+| PP | First Point (polyline) | Origin for polygon drawing |
+| CE | Center | Arc center point |
+| AL | Angular Length | Sweep angle of an arc |
+| LA | Line Angle | Orientation angle of a segment |
+| A1 / A2 | CCW Angle / CW Angle | Start and end angles of an arc |
+| RD | Radius | Curvature radius (positive = CCW) |
+| LN | Length | Total length of the segment |
+| HT / WT | Height / Width | For rectangular fills |
+| PV | Pivot | Pivot point for rotation |
+| VC | Point Count | Number of polygon vertices |
+| LW | Line Width | Stroke width in pixels |
+| LT | Line Type | SOLID, DASHED, DOT, etc. |
+| CO | Color | RGB color index |
+| FL | Filled | TRUE/FILL_POLY or FALSE/empty |
+| OP | Open End | For open vs closed polyline |
+| BX | Boxed | Draw a bounding box around the segment |
+| BE | Bench Choice | Which bench definition to use |
+| OR | Orientation | How the bench is oriented on the track |
+| DS | Size | Dimension label size/font |
+| TP | Text Origin | Position of text annotation |
+| TA | Text Angle | Rotation of text |
+| TS | Font Size | Point size for text |
+| TX | Text | The actual string to draw |
+| LK | Lock To Origin | Whether origin stays fixed during moves |
+| OI | Rot Origin | X,Y of the rotation origin |
+| RA | Rotate By | Angle offset applied on creation |
+| LY | Layer | Which layer this segment belongs to |
 
 ---
 
-## Drawing Line Types
+## The Description System: Editing Fields via Dialogs
 
-| Constant | Value | Appearance | Usage |
-|----------|--------|------------|-------|
-| `DRAWLINESOLID` | 0 | Continuous line | Standard track geometry, dimension lines |
-| `DRAWLINECENTERSOLID` | 1 | Solid with center ticks | Centerlines, centermarks |
-| `DRAWLINECENTERDOT` | 2 | Dashed centerline | Alternate centermark style |
-| `DRAWLINEDASHED` | 3 | Long-dash pattern | Hidden edges, optional features |
-| `DRAWLINEDASHDOT` | 4 | Dash-dot pattern | Construction lines |
-| `DRAWLINEDASHDOTDOT` | 5 | Dash-dot-dot pattern | Fine construction lines |
-| `DRAWLINEPHANTOM` | 6 | Long dash + short dot | Phantom lines (alternate position) |
-| `DRAWLINEDOT` | 7 | Dotted line | Dimension extensions, leader lines |
+The description system allows editing any field of a segment through a dialog UI. When a user edits a value, the `UpdateDraw()` function recomputes all derived quantities and redraws the track.
 
----
+### Core Concepts
 
-## Key Functions
+- **`descData_t`** — A record describing one editable field: its label (translated string), the pointer to where it's stored in memory, and how that memory location changes when edited.
+- **`drawDesc[]`** — An array of `descData_t` records defining every possible editable field. Each has a mode flag (`DESC_POS`, `DESC_FLOAT`, `DESC_ANGLE`, `DESC_DIM`, `DESC_LIST`, etc.) and a pointer to the target variable.
+- **`DrawNewTrack(track_p trk)`** — Called after an edit: undoes the old drawing, calls `UpdateDraw()` with the changed field index, then redraws.
+- **`UndrawNewTrack(track_p trk)`** — Removes the old geometry from the screen before a new draw is rendered.
 
-### `LoadFontSizeList(wList_p list, long curFontSize)`
+### Editing Workflow
 
-Populates a GTK combo-box/list with available font sizes. The function:
-- Builds a list of common sizes (4pt through 180pt) plus the user's custom "large" size
-- Inserts the current font size into the middle of the list so it's easily accessible
-- Calls `wSetSelectedFontSize()` to set GTK's internal cursor position
+1. User clicks "Properties" on a track → opens a GTK dialog containing labels and controls (spinners, sliders, text boxes) for each field.
+2. Dialog callbacks set the corresponding field in `drawData` (a global struct that accumulates pending edits).
+3. When the user hits OK, the description system walks through all fields marked as changed (`DESC_CHANGE`), calling `UpdateDraw()` for each one.
+4. `UpdateDraw()` undraws the segment and redraws it with the new geometry.
 
-**Parameters:**
-- `list` — The GTK combo-box or list widget to populate
-- `curFontSize` — Current selected font size (in points)
+### Special Cases
+
+- **Pivot-based editing** (LA, AL): changes a field that affects the overall shape by rotating or scaling around a pivot point.
+- **Origin locking** (LK, OI): when locked, moving an endpoint also moves the origin; when unlocked, the object stays visually static while internal coordinates change.
+- **Radius vs length coupling**: for arcs, changing radius automatically updates length and vice versa via shared computed fields.
 
 ---
 
-### `GetFontSize(wIndex_t inx)`
+## Drawing Functions
 
-Retrieves the font size value corresponding to a given index into `fontSizeList`. Used by the GTK menu callback to convert the selected index back to a point value.
+### `DrawTrack(track_p trk)` — Render a Track Object
 
-**Returns:** Font size in points, or -1 if index is out of range.
+This is the primary drawing entry point:
 
----
+1. If the track has no bounding box or is off-screen, skip it (optimization).
+2. Retrieve extra data for the track type (`T_CORNU`, `T_BEZIER`, etc.).
+3. Iterate over all segments in that object's geometry array.
+4. For each segment:
+   - If it's a Bezier sub-segment, delegate to `DrawBezierSegment()`.
+   - Otherwise, render directly using GTK+ primitives (`gtk_arc` for arcs, `gtk_draw_polygon` for polygons/lines, etc.).
 
-### `GetFontSizeIndex(long size)`
+### `DrawTrack(track_p trk, int type)` — Draw with a Specific Style
 
-Finds the index (0-based) for a given font size within the standard list. Returns -1 if the size is not found in the predefined table.
-
----
-
-### `UpdateFontSizeList(long *fontSizeR, wList_p list, wIndex_t listInx)`
-
-Called when the user modifies a custom font size via the "large-font-size" preference dialog. It:
-- Validates that the new size is positive
-- Warns if it exceeds the system-wide "large font size" threshold (pref `misc.large-font-size`, default 500) and asks for confirmation
-- Updates both the GTK display value and the stored preference
-- Refreshes the list if needed
-
-**Parameters:**
-- `fontSizeR` — Pointer to the current font size variable (updated in place)
-- `list` — The widget list being updated
-- `listInx` — Index of the item being edited, or -1 for a new entry
+A variant that accepts an explicit style argument. Used when drawing previews during drag-and-drop or undo operations.
 
 ---
 
-### `MakeDrawFromSeg(coOrd pos, ANGLE_T angle, trkSeg_p sp)`
+## Distance and Hit Detection
 
-Converts a single track segment into a drawing object (type T_DRAW). It:
-- Allocates a new track with type `T_DRAW`
-- Copies the segment data into an `extraDataDraw_t` structure
-- If the segment is a Bezier curve, calls `FixUpBezierSegs()` to normalize control points before converting
-- Calls `MoveBezier()` and `RotateBezier()` to transform the curve to its final position/angle
+The "arm" (selection cursor) uses these distance functions to determine whether the user is hovering over a segment:
 
-**Parameters:**
-- `pos` — Placement origin (pixels from viewport origin)
-- `angle` — Rotation angle in degrees
-- `sp` — Pointer to the source segment (`trkSeg_t`)
+### `DistanceDraw(track_p t, coOrd *p)` — Distance from Point to Draw Object
 
-**Returns:** The newly created drawing track, or NULL if the source segment is invalid.
+Returns the shortest distance from point `p` to any of the segments in object `t`. If the object is ignored (e.g., table edge or already-selected), returns infinity. Calls down into generic `DistanceSegs()` which computes perpendicular distances for lines/arcs and Euclidean distance for points.
 
 ---
 
-### `MakePolyLineFromSegs(coOrd pos, ANGLE_T angle, dynArr_t * segsArr)`
+## Summary Table
 
-Aggregates multiple segments (lines, arcs, Bezier approximations) into a single **polyline** drawing object. This is used when:
-- Converting a chain of connected segments into one polyline
-- Combining several small straight/arced pieces into a single polygon for filling/rendering optimization
-
-The function walks through the segment array and:
-1. Detects where consecutive segments meet (by checking if endpoints are coincident)
-2. For each arc, computes intermediate points using `SliceCuts()` to determine how many line/arc segments approximate it well enough
-3. Builds a vertex list with `pts_t` entries tagged as `wPolyLineStraight`, `wPolyLineCorner`, or `wPolyLineSmooth` (for arcs)
-
-**Parameters:**
-- `pos` — Origin of the resulting polyline
-- `angle` — Rotation angle
-- `segsArr` — Dynamic array of segments to aggregate
-
-**Returns:** A new track containing a single polygon segment with all vertices.
+| Function | Purpose |
+|----------|---------|
+| `LoadFontSizeList()` / `GetFontSize()` / `UpdateFontSizeList()` | Manage a dropdown list of font sizes (4–500 pt) with memory-efficient storage |
+| `MakeDrawFromSeg1()` / `MakeDrawFromSeg()` | Create a new draw object from a single segment record; handles Bezier decompression |
+| `MakePolyLineFromSegs()` | Convert an array of segments into a polyline (used for slicing curves at gauge width) |
+| `SliceCuts(angle, radius)` | Determine how many arc slices are needed to keep chord error below 0.05 units |
+| `DrawOriginAnchor(track_p trk)` | Draw blue crosshairs indicating the origin of a draw object (for visual reference during editing) |
+| `DistanceDraw()` / `OnDraw(track_p t, coOrd *p)` | Hit-testing and distance queries for selection |
+| `UpdateDraw(trk, inx, descUpd, final)` | Apply changes to a segment field; handles reorientation of all dependent points |
+| `UndrawNewTrack()` / `DrawNewTrack()` | Remove old geometry before redrawing (used during edit operations) |
 
 ---
 
-### `MakePolyFromSegs(coOrd pos, ANGLE_T angle, dynArr_t * segsArr)`
+## Notes
 
-Similar to `MakePolyLineFromSegs`, but produces a **filled polygon**. The segments must form a closed loop (first and last endpoints coincide). This is used for:
-- Filled regions (e.g., shaded areas)
-- Polygonal track shapes that need interior filling
-
----
-
-### `MakeTextTrack(coOrd pos, ANGLE_T angle, char * textString)`
-
-Creates a track containing only a text label. The text is stored in an embedded string field and drawn using the GTK font rendering system (via `wDrawLabel()` or equivalent). Used for:
-- Elevation markers
-- Switch names
-- Station numbers
-- Notes and annotations
-
----
-
-### `MakeLineFromSeg(coOrd pos, ANGLE_T angle, trkSeg_p sp)`
-
-Creates a drawing object from a segment. If the segment is a Bezier curve, it first expands the Bezier into its underlying line/arc approximations before creating the draw track.
-
-**Returns:** A new T_DRAW track or NULL on error.
-
----
-
-## SliceCuts() — Arc Discretization
-
-```c
-int SliceCuts(ANGLE_T a, DIST_T radius)
-{
-    double Error = 0.05;
-    double Error_angle = acos(1-(Error/fabs(radius)));
-    if (Error_angle < 0.0001) { return 0; }
-    return (int)(floor(D2R(a)/(2*Error_angle)));
-}
-```
-
-Determines how many line segments are needed to approximate a circular arc of angle `a` and radius `radius`. The error bound is set at 0.05 pixels — the maximum perpendicular deviation between the true arc and its polyline approximation must not exceed this value. This ensures rendering quality even for high-resolution displays.
-
----
-
-## BoundingBox Computation
-
-```c
-static void ComputeDrawBoundingBox(track_p t)
-{
-    struct extraDataDraw_t * xx = GET_EXTRA_DATA(t, T_DRAW, extraDataDraw_t);
-    coOrd lo, hi;
-    GetSegBounds(xx->orig, xx->angle, xx->segCnt, xx->segs, &lo, &hi);
-    hi.x += lo.x;
-    hi.y += lo.y;
-    SetBoundingBox(t, hi, lo);
-}
-```
-
-Computes the axis-aligned bounding box of a drawing object by:
-1. Calling `GetSegBounds()` to get local min/max coordinates relative to origin
-2. Shifting back to viewport space (adding origin offset)
-
-The bounding box is stored in the track for culling and acceleration purposes.
-
----
-
-## Text Font Management
-
-XTrkCad uses GTK's font rendering system. The application maintains a list of available font families and sizes. Custom large fonts are stored as preferences (`misc.large-font-size`). When the user changes the custom size, `UpdateFontSizeList()` is invoked to refresh both the preference file and the GTK widget display.
-
----
-
-## Related Files
-
-| File | Purpose |
-|------|---------|
-| `cdraw.h` | Type definitions (`extraDataDraw_t`, drawing line types) |
-| `track.h` / `cstruct.c` | Base track structure and segment union types |
-| `tbezier.h` / `tbezier.c` | Bezier curve evaluation (used when converting drawn tracks back to segments) |
-| `common-ui.h` | GTK widget wrappers (`wList`, `wFontSize_t`) |
-| `drawgeom.c` | Interactive drawing commands that produce the segments fed into this module |
+- The draw object system is intentionally generic: the same `UpdateDraw()` function can handle editing of any field on any segment type, because each field's effect is expressed as a transformation applied to its stored coordinates.
+- Bezier segments are decomposed into line and arc pieces by `FixUpBezierSegs()`, then rendered using basic GTK+ drawing primitives — no custom rasterization is needed.
+- The description system decouples "what the user edits" from "where the data lives," enabling dynamic addition of new fields without changing core logic.

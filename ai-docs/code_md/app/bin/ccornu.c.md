@@ -1,188 +1,180 @@
-# ccornu.c — Cornu Easement Curve Generation and Editing
+# ccornu.c — Cornu Easement Track Commands
 
 ## Overview
 
-`ccornu.c` implements **Cornu easement curves** (also known as Euler spirals or clothoid curves) for smooth transitions between track segments of different radii. A Cornu curve has the property that **curvature increases linearly along its length**, which means lateral acceleration changes evenly — a critical comfort and safety requirement in rail design.
+`ccornu.c` implements **Cornu easement tracks** (`T_CORNU`) and the "Convert To/From" commands. A Cornu track is a smooth transition between two arbitrary endpoints (position, angle, and curvature). It uses Raph Levien's Bezier approximation library to approximate a true Cornu spiral with a sequence of arcs and straight segments.
 
-The implementation uses Raph Levien's PhD-thesis-based Bezier approximation approach: it generates control points (knots) for a series of cubic Bezier curves that collectively approximate the mathematical Cornu spiral. The final track geometry is then converted into arc/line segments via `ccurve.c`.
-
----
-
-## Key Concepts
-
-### What is a Cornu Easement?
-
-A Cornu spiral connects two circular arcs (or a straight line and an arc) with **G² continuity** — meaning position, tangent direction, AND curvature are all continuous at the junctions. Unlike simple clothoids which require infinite length to achieve zero-to-infinite-radius transitions, this implementation supports:
-- Start or end with a fixed-radius circle (non-zero radius)
-- Start or end with zero curvature (straight line)
-- Smoothly varying sharpness (the rate of curvature change is derived from endpoint constraints rather than being user-specified)
-
-### Knots and Control Points
-
-The Cornu curve is defined by a sequence of **knot points** along a parameterized "line" in the complex plane. These knots define piecewise cubic Bezier curves whose control polygon approximates the Cornu spiral. The algorithm:
-1. Takes two end conditions (position, angle, radius at each end)
-2. Interpolates intermediate control points between them
-3. Produces a chain of Bezier segments that smoothly connect
-
-### Why Not Use the Mathematical Formula Directly?
-
-The true Cornu integral involves Fresnel integrals which are expensive to evaluate repeatedly during interactive editing. The Bezier approximation approach:
-- Is computationally cheap for real-time preview and drag operations
-- Can be evaluated using simple arc/line segments (already handled by `ccurve.c`)
-- Allows the track to be stored as a series of standard segment types
+The file handles:
+- **Creating** a new Cornu track by placing two endpoints and dragging intermediate points along the curve.
+- **Modifying** an existing Cornu track (dragging endpoint circles, adding mid-points, changing radius/angle at ends).
+- **"Convert To"** — replaces any selectable tracks with a single Cornu that smoothly joins them.
+- **"Convert From"** — breaks a Cornu back into individual track segments.
 
 ---
 
-## Core Structures
+## Key Data Structures
 
-### `endHandle` — Endpoint Condition Handler
+### `endHandle` — Handles for end-point control circles
 
 ```c
 typedef struct {
-    coOrd end_center;      // Center point for this endpoint's circular arc condition
-    coOrd end_curve;       // Point on the curve at this endpoint (or projected from center)
-    DIST_T mid_disp;       // Offset used to position anchor graphics
-    BOOL_T end_valid;      // TRUE if this endpoint has a valid, usable condition
-    BOOL_T angle_selected; // User is currently dragging the angle control
-    BOOL_T radius_selected;// User is currently dragging the radius control
-    BOOL_T last_selected;  // TRUE if this is the most recently selected endpoint
-    ANGLE_T arc_angle;     // Computed sweep angle of the circular arc segment
+    coOrd end_center;     // Center of the outer control circle (radius = 0.25 * scale)
+    coOrd end_curve;      // A point on the curve at the end handle
+    DIST_T mid_disp;      // Offset from center to the curve-point along the tangent direction
+    BOOL_T end_valid;     // TRUE if this endpoint is currently valid (not extended off-track)
+    BOOL_T angle_selected;// If TRUE, dragging changes the end angle instead of radius
+    BOOL_T radius_selected;// If TRUE, dragging changes the end radius instead of angle
+    BOOL_T last_selected; // Which handle was last selected (for highlighting)
+    ANGLE_T arc_angle;    // Total turn angle at this end (used for drawing)
 } endHandle;
 ```
 
-This structure holds data for **one side** (start or end) of a Cornu easement. Two instances are maintained simultaneously — one for each track that will be connected.
+### `Da` — Global Command State (static)
 
----
+All command-state variables are stored in the static struct `Da`:
 
-## State Machine
+| Member | Type | Description |
+|--------|------|-------------|
+| `state` | enum Cornu_States | Current sub-state: NONE, POS_1, LOC_2, PICK_POINT, POINT_PICKED, TRACK_SELECTED |
+| `pos[4]` | coOrd[] | The two track endpoints and any mid-point handles |
+| `number_of_points` | int | Number of mid-points added between the ends |
+| `selectEndPoint` / `selectMidPoint` / `selectEndHandle` | int | Which handle is currently under mouse (−1 = none) |
+| `prevSelected` | int | Previous selected handle (used for undo/backspace) |
+| `trk[2]` | track_p[] | The two tracks connected to the Cornu ends (NULL if not yet connected) |
+| `ep[2]` | EPINX_T[] | Index of the endpoint on each track (−1 = open end) |
+| `radius[2]`, `angle[2]`, `center[2]` | DIST_T, ANGLE_T, coOrd[] | The three parameters defining each end's geometry |
+| `arcA0[2]`, `arcA1[2]` | ANGLE_T[] | Arc start/end angles for this track end (when radius ≠ 0) |
+| `extend[2]`, `extendSeg[2]` | BOOL_T, trkSeg_t[] | Whether an extra straight/curved segment is attached to extend the Cornu outward |
+| `mid_points` / `crvSegs_da` | dynArr_t[] | Arrays of mid-point positions and generated curve segments |
+| `bezc` | bezctx* | Pointer to a Bezier context object (from spiro library) |
+| `cmdType` | cornuCmdType_e | Is this CREATE, MODIFY, or hotbar command? |
 
-The editing state machine has these states:
-
-| Constant | Value | Meaning |
-|----------|-------|---------|
-| `NONE` | 0 | Not in a Cornu command; idle |
-| `POS_1` | 1 | User is picking the first endpoint location |
-| `LOC_2` | 2 | Dragging radius at endpoint 2 |
-| `POS_2` | 3 | Dragging position of second endpoint |
-| `PICK_POINT` | 4 | Picking a midpoint insertion point along the curve |
-| `POINT_PICKED` | 5 | A midpoint has been selected; dragging it changes shape |
-| `TRACK_SELECTED` | 6 | Connected track is being modified (e.g., its end condition changed) |
-
----
-
-## Key Functions
-
-### `CallCornuM(dynArr_t extra_points, BOOL_T end[2], coOrd pos[2], cornuParm_t * cp, dynArr_t * array_p, BOOL_T spots)`
-
-**Main entry point for creating a Cornu curve.** It:
-1. Allocates and initializes a new Bezier context (`new_bezctx_xtrkcad`)
-2. Constructs an array of 6+ knots (control points) defining the Cornu spiral
-3. Calls `TaggedSpiroCPsToBezier()` to close the Bezier context and compute control polygons
-4. Writes the resulting segments into the output dynamic array
-
-The knot construction logic:
-- If endpoint radius is zero → creates two offset points along the tangent direction (simulating a "zero-curvature" start/end)
-- If endpoint radius is non-zero → computes points on the circle at ±5° and ±10° from the connection angle (these become inner/outer control handles of the adjacent Bezier segment)
-- Intermediate knots (G₂, G₄ junctions) are placed between the two ends
-
-**Return value:** `TRUE` if a valid Cornu curve was computed; `FALSE` if the algorithm failed (e.g., too much looping detected).
-
----
-
-### `CallCornu0(coOrd pos[2], coOrd center[2], ANGLE_T angle[2], DIST_T radius[2], dynArr_t * array_p, BOOL_T spots)`
-
-Similar to `CallCornuM` but **without** extra user-inserted midpoint points. Used during initial creation when no midpoints have been added yet.
-
----
-
-### `createEndPoint(trkSeg_t sp[], coOrd pos0, BOOL_T point_selected, BOOL_T point_selectable, BOOL_T track_modifyable, BOOL_T track_present, ANGLE_T angle, DIST_T radius, coOrd centert, endHandle * endHandle)`
-
-Draws the **endpoint anchor graphics** for a given side of the Cornu curve. It creates:
-- A small filled circle at the endpoint (indicates locked/cannot-move) or open arc (free to move)
-- If `track_modifyable` is TRUE and no connected track exists, draws extra anchors showing radius-adjustment handles and an angle-hint arrow
-- If a connected track exists, draws line segments along the gauge perpendicular to the connection direction
-
-The function also populates `endHandle->arc_angle` with the sweep angle of any circular arc component.
-
-**Return value:** Number of segments drawn (always 1 or 2).
-
----
-
-### `createMidPoint(dynArr_t * ap, coOrd pos0, BOOL_T point_selected, BOOL_T point_selectable, BOOL_T track_modifyable)`
-
-Creates a midpoint anchor along the Cornu curve. Each midpoint is represented as a small circular arc centered on that location — drag it to insert a new knot (refining the Bezier approximation), or delete it by moving the cursor away.
-
----
-
-### `DrawTempCornu()`
-
-Draws all the preview graphics for an in-progress Cornu easement:
-- The two end anchor circles/lines
-- The series of small circles representing midpoints
-- The main curve itself (as a black line using `DrawSegs()`)
-- Red coloring if the minimum radius along the curve falls below the layout's configured minimum
-
-This is called from the drawing state machine on every mouse event.
-
----
-
-### `GetConnectedTrackParms(track_p t, const coOrd pos, int end, EPINX_T track_end, wBool_t extend)`
-
-Extracts the endpoint condition parameters (position, angle, radius) from a connected track and stores them into global variables for use by `CallCornuM`. It handles:
-- Straight tracks → maps to zero-radius Cornu end
-- Circular arcs → extracts center/radius/angle
-- Other Cornu easements → reads their stored endpoint parameters
-- Turntables → special handling via turntable-specific parameters
-
-**Return value:** `TRUE` if successful.
-
----
-
-### `CorrectHelixAngles()`
-
-Adjusts the angle values for helical (3D) tracks so that the Cornu computation uses consistent reference directions at each end. If one endpoint belongs to a helix, its angle must be rotated by 180° relative to the other side.
-
----
-
-### `CheckHelix(track_p trk)`
-
-Validates that a proposed Cornu easement does not create illegal connections: if both connected tracks are helices, their helical directions must be compatible (they point toward each other in space). Returns `FALSE` and displays an error message if incompatible.
-
----
-
-### `CreateCornuFromPoints(coOrd pos[2], BOOL_T track_end[2])`
-
-Constructs a fully formed Cornu easement track object from two endpoint positions and their associated conditions (angles/radii/centers already stored in global state). Returns a new `track_p` that contains the full segment list. If creation fails, beeps and shows an error with the computed parameters.
-
----
-
-### `GetAngleSegs(int segCount, trkSeg_t * segs, coOrd * pos, int * segInx, track_p * connectedTrackP, wBool_t * back, int * subinx, wBool_t * neg)`
-
-A utility that walks along a polyline or Bezier-chain (the Cornu curve) and finds the angle at a given point. This is used when midpoints are inserted so that the user can drag them to reshape the curve interactively.
-
----
-
-## The `cornuParm_t` Structure
+### Enum: Cornu Command States
 
 ```c
-typedef struct {
-    coOrd pos[2];      // Endpoint positions (pixels from viewport origin)
-    ANGLE_T angle[2];  // Tangent angle at each endpoint (degrees CCW from horizontal)
-    coOrd center[2];   // Center of circular arc at this end (zero if straight)
-    DIST_T radius[2];  // Radius of circular arc; zero means straight line
-} cornuParm_t, *cornuParm_p;
+enum Cornu_States { NONE,  // No active operation
+                     POS_1,     // First endpoint placed; waiting for second
+                     LOC_2,     // Second endpoint placed; waiting for confirmation
+                     PICK_POINT,// Waiting to pick a mid-point on the curve
+                     POINT_PICKED, // A mid-point is selected and ready to drag
+                     TRACK_SELECTED  // A track has been selected in modify mode
+                   };
 ```
-
-This is the canonical parameter set used by `CallCornuM` and related functions.
 
 ---
 
-## Related Files
+## Anchor Drawing Functions
 
-| File | Purpose |
-|------|---------|
-| `ccornu.h` | Type definitions including `endHandle`, `cornuParm_t`, enums |
-| `tcornu.c/tcornu.h` | User interface dialogs for Cornu creation/editing (param panel, hotbar) |
-| `cbezier.c/cbezier.h` / `tbezier.h` | Bezier curve generation and evaluation |
-| `ccurve.c/ccurve.h` | Conversion of Bezier chains to arc/line segments |
-| `spiro.h/spiroentrypoints.h` | Raph Levien's spiral/Bézier control point utilities |
+### `CreateCornuEndAnchor(coOrd p, wBool_t lock)` — Draw an end-point anchor circle
+
+Draws a small blue arc (half-circle) around the given point. If `lock` is TRUE, it's filled solid; otherwise it's an open arc. Used to show whether the endpoint is locked or adjustable during creation/modification.
+
+### `CreateCornuExtendAnchor(coOrd p, ANGLE_T a, wBool_t selected)` — Draw extend handle arrows
+
+Draws three small blue arrow segments pointing outward from point `p` in directions perpendicular to the track tangent. Used when the user holds Shift and drags an endpoint off its natural end point to "extend" the Cornu with a straight or curved extension segment.
+
+### `CreateCornuAnchor(coOrd p, wBool_t open)` — Draw mid-point handle
+
+Draws either a filled circle (if locked) or an open arc around a mid-point on the curve. Used for interactive editing of point positions during modification mode.
+
+---
+
+## Core Command Handler: `CmdCornu`
+
+This is the main entry point, invoked from the hotbar and menu items. It dispatches based on keyboard/mouse actions (`C_START`, `wActionMove`, `C_DOWN`, `C_MOVE`, `C_UP`, `C_OK`, `C_CANCEL`, etc.) through a large switch statement.
+
+### State Machine Overview
+
+1. **NONE** → User places first endpoint (left-click in empty space or on an open track end). Enters `POS_1`.
+2. **POS_1** → User places second endpoint. Enters `LOC_2` or `PICK_POINT` depending on whether the end is connected to a track.
+3. **POINT_PICKED / TRACK_SELECTED** → Mid-point handles are available for drag interaction.
+4. **C_UP** from PICK_POINT returns to PICK_POINT (allowing multiple points). C_OK confirms and creates the Cornu; C_CANCEL resets state.
+
+### Key Functions Called During Command Flow
+
+- `CreateBothEnds()` — Draws all endpoint anchor circles and mid-point handles.
+- `CallCornuM()` / `CallCornu0()` — Computes a Bezier approximation of the Cornu given two endpoints (and optional intermediate points).
+- `CorrectHelixAngles()` — Adjusts angles for helices/circles so they are oriented correctly.
+- `CheckHelix()` — Ensures a track isn't already connected to both ends of a circle/helix (would create a loop).
+
+---
+
+## Cornu Creation and Construction
+
+### `CallCornu(coOrd pos[2], track_p trk[2], EPINX_T ep[2], dynArr_t * array_p, cornuParm_t * cp)` — Compute the curve segments for a Cornu given end conditions
+
+This is the primary constructor. It:
+1. Reads the end parameters from either connected tracks (via `GetTrackParams`) or from user-placed endpoints (`Da.pos`, `Da.radius`, `Da.center`).
+2. Calls `CallCornu0()` which uses Raph Levien's Bezier context to produce a list of arcs and straight segments that approximate the Cornu spiral between the two given ends.
+3. Returns TRUE on success, FALSE if no valid solution exists (e.g., too much winding).
+
+### `CreateBothEnds(int selectEndPoint, int selectMidPoint, int selectEndHandle, int lastSelected)` — Draw all endpoint and mid-point handles
+
+Populates segment arrays for drawing the interactive handles:
+- If an endpoint is connected to a track, draws small red/blue circles around its open end.
+- If `track_modifyable` is TRUE (the track's Cornu can be edited), the inner circle is drawn as a selectable ring rather than filled.
+- Mid-points that have been added are drawn similarly.
+- Extend handles (Shift+drag) appear when the user is extending an endpoint off its natural position.
+
+---
+
+## Modify Command: `AdjustCornuCurve` and `CmdCornuModify`
+
+When the user selects a Cornu track via **Right-click → "Edit"** or similar, this command runs. It sets up `Da.commandType = CORNU_MODIFY` and then uses a similar state machine to allow editing of an existing Cornu's geometry.
+
+### How Modify Works
+
+- The original track is hidden; the editable Cornu (computed from current parameters) is shown.
+- User can drag endpoint circles to change radius/angle, or click on the curve to add/remove mid-points.
+- **Shift+drag** extends an endpoint off its natural position, inserting a straight or curved extension segment.
+- On Enter/OK: the old track segments are deleted; new tracks (straight lines and arcs) are created for any extensions; the Cornu is recreated with updated endpoints/midpoints.
+
+### `UpdateSwitchMotor(track_p trk, int inx, descData_p descUpd, BOOL_T needUndoStart)` — Wait, that's from cswitchmotor.c... 
+
+Actually the modify handler here has a similar edit callback via `cornuModPG` (a param group for end radius/angle fields) and a dialog update function.
+
+---
+
+## Convert Commands
+
+### `CmdConvertTo(wAction_t action, coOrd pos)` — Replace selected tracks with a Cornu track
+
+The user selects one or more connected tracks and invokes "Convert To Cornu":
+1. For each selected chain of connected tracks, collect the endpoint positions/angles from all segments.
+2. Compute a single Cornu that interpolates through all those endpoints (using mid-points derived from the original segments).
+3. Delete all old tracks; insert one new `T_CORNU` track representing the smooth transition.
+
+### `CmdConvertFrom(wAction_t action, coOrd pos)` — Break a Cornu back into individual arcs/lines
+
+The user selects a Cornu and invokes "Convert From":
+1. Decompose the Cornu's Bezier approximation into its constituent straight segments (`SEG_STRLIN`) and curved segments (`SEG_CRVTRK`).
+2. For each segment, create an actual track object of type `T_CORNU` (or `T_BEZIER` depending on implementation).
+3. Reconnect endpoints between consecutive segments so that the result is a chain of ordinary tracks rather than one compound Cornu.
+
+---
+
+## Summary Table
+
+| Function | Purpose |
+|----------|---------|
+| `CmdCornu()` | Main entry point for create and join-with-cornu commands; implements the state machine |
+| `AdjustCornuCurve()` | Edit callback for modify mode (dragging handles, adding points) |
+| `CmdCornuModify()` | Entry point when user edits an existing Cornu track |
+| `CallCornu()` / `CallCornu0()` | Compute the Bezier-approximated Cornu curve from endpoint conditions |
+| `CreateBothEnds()` | Draw all interactive handle circles (endpoints and mid-points) |
+| `GetAngleSegs()` | Extract angle at a given point along a polyline/curve segment list |
+| `CornuLength()` | Compute total length of the Cornu by summing arc lengths and straight segments |
+| `CornuOffsetLength(offset)` | Compute length with an offset (used for parallel curves) |
+| `CornuMinRadius()` / `CornuMaxRateofChangeofCurvature()` / `CornuTotalWindingArc()` | Quality metrics for validating a proposed Cornu solution |
+| `CorrectHelixAngles()` | Adjust angles for helices/circles so they align with the tangent direction |
+| `GetTracksFromCornuTrack()` | Decompose a Cornu track into its constituent straight/arc segments |
+| `CreateCornuEndAnchor()` / `CreateCornuExtendAnchor()` / `CreateCornuAnchor()` | Draw various handle graphics (endpoint circles, mid-point rings, extend arrows) |
+
+---
+
+## Notes
+
+- **Raph Levien's Cornu Library**: The actual spiral computation is offloaded to a library (`spiro.h`/`spiro.c`) which uses Bezier curves as an approximation. This `ccornu.c` file acts as the interface layer, managing state and user interaction.
+- **End handles** are drawn using small arc segments (not filled circles) so that they don't interfere with normal track hit-testing; the cursor is set to invisible (`wCursorNone`) when drawing them so that clicks register on the underlying anchor.
+- **Helix/turntable compatibility**: The code handles special cases where an endpoint connects to a turntable or helix (tracks with variable endpoints). These have different rules: a turntable can accept a Cornu at any point along its wall; a helix must not already be connected to both ends (which would form a loop).
+- **Conversion**: "Convert To" and "Convert From" provide a way to change the fundamental representation of track geometry — from fixed arcs/straights to a single smooth Cornu, or vice versa. This is useful for simplifying complex layouts into cleaner geometric descriptions.
