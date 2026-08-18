@@ -7,7 +7,7 @@
 
 ---
 
-## Files Processed (Part 12 — app/bin)
+## Files Processed
 
 | # | File | Status | Notes |
 |---|------|--------|-------|
@@ -25,26 +25,41 @@
 | 12 | misc.c | ✅ | Completed |
 | 13 | cdraw.c | ✅ | Completed |
 | 14 | cselect.c | ✅ | Completed |
-| 15 | dcar.c | ✅ | Completed |
-| 16 | dcmpnd.c | ✅ | Completed |
-| 17 | dcontmgm.c | ✅ | Completed |
-| **18** | **dcustmgm.c** | ✅ | **Completed** |
+| 15 | cswitchmotor.c | ✅ | Completed |
+| 16 | common-ui.h | ✅ | Completed |
+| 17 | common.h | ✅ | Completed |
+| 18 | cmisc.c | ✅ | Completed |
+| 19 | command.h | ✅ | Completed |
+| 20 | ccontrol.c | ✅ | Completed |
+| 21 | ccornu.h | ✅ | Completed |
+| 22 | ccurve.c | ✅ | Completed |
+| 23 | dcar.c | ✅ | Completed |
+| 24 | dcmpnd.c | ✅ | Completed |
+| 25 | dcontmgm.c | ✅ | Completed |
+| 26 | dcustmgm.c | ✅ | Completed |
+| 27 | dlayer.c | ✅ | Completed |
+| 28 | doption.c | ✅ | Completed |
+| 29 | dpricels.c | ✅ | Completed |
+| 30 | dprmfile.c | ✅ | Completed |
+| 31 | draw.c | ✅ | Completed |
+| 32 | dxfformat.c | ✅ | Completed |
+| 33 | dxfoutput.c | ✅ | Completed |
+| 34 | dxfformat.h | ✅ | Completed |
+| 35 | elev.c | ✅ | Completed |
+| 36 | fileio.c | ✅ | Completed |
 
 ---
 
-## Files Pending (Part 12 — app/bin)
+## Files Pending
 
-### dlayer.c ← Next
-- Layer management for tracks and layout objects
-- Assigning, changing, and managing layers in the drawing system
-
-### doption.c
-- Option/setting management for track parameters
-- Reading/writing parameter values from/to files or UI dialogs
+| # | File | Status | Notes |
+|---|------|--------|-------|
+| 37 | file2uri.c | 🔴 | Not yet started |
+| ... | (remaining) | 🔴 | Not yet started |
 
 ---
 
 ## Summary
-- **Completed:** 18 files (~36%) of app/bin
-- **Next in queue:** dlayer.c → remaining utility/data-access files (doption, draw, fileio, etc.)
-- **Estimated remaining:** ~5–6 more .c files + header files
+- **Completed:** 36 files (≈60%)
+- **Pending review:** 0 files
+- **Not yet started:** ~14 remaining files in app/bin/

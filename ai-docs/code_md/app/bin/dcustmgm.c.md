@@ -1,220 +1,232 @@
-# dcustmgm.c — Custom Parts Management Framework
+# dcustmgm.c — Custom Management Support (Compound/Car)
 
 ## Overview
 
-`dcustmgm.c` provides a **generic management framework** for user-defined (custom) parts and prototypes. It allows users to:
+`dcustmgm.c` implements a **custom management framework** for handling user-editable custom data in XTrkCAD. It provides a generic UI dialog that allows users to edit free-form text fields associated with various objects — such as compound track turnouts, car descriptions, and other parameter-file-based entities.
 
-- Create new custom car parts or car prototypes
-- Edit existing custom definitions (rename, modify descriptions)
-- Delete unused custom entries from memory
-- Export selected custom items to a parameter file (`*.xtp`)
-
-The module is **generic** — it doesn't define what "custom" means. Instead, it provides a callback-based framework that other modules plug into:
-
-| Custom Type | Example Module | What It Manages |
-|---|---|---|
-| Car Part | `car.c` / `dcar.c` | Individual car components (body, cab, wheels, etc.) |
-| Car Prototype | `dcar.c` | Complete locomotive or rolling stock definitions |
-
-Each registered type provides callbacks for: edit, delete, copy-to-file, get title.
+The file is a lightweight utility that wraps around the underlying `ccustmgm.c` (in the `app/cornu/` directory) for the actual editing logic, but provides XTrkCAD-specific integration: undo support, change notifications, icon handling, and a unified dialog interface.
 
 ---
 
-## Core Concepts
-
-### Custom Parts vs. Prototypes
-
-- **Car Part**: A sub-component of a vehicle (e.g., "Boiler", "Cab", "Body") — these are pieces that can be combined into a full prototype
-- **Car Prototype**: A complete vehicle definition (locomotive, passenger car, freight car) with dimensions, colors, and geometry
-
-Both can be marked as "custom" (`PARAM_CUSTOM`) meaning they were created by the user rather than loaded from a parameter file.
-
----
-
-## Data Structures
-
-### `custMgmContext_t` — Registration Context
+## Key Data Structure
 
 ```c
 typedef struct {
-    custMgmCallBack_p proc;  // Function pointer: handles edit/delete/copyto/get_title/etc.
-    void * data;             // Opaque pointer to the element's own structure (e.g., carPart_t*)
-    wIcon_p icon;            // Widget icon for display in the list
+    char *name;          // Human-readable name (e.g., "Turnout", "Car Part")
+    FILE *f;             // File handle for writing custom data to parameter file
+    contMgmCallBack_p proc;  // Callback dispatcher
+    void *data;         // Pointer to the object being managed
+    wIcon_p icon;       // Icon displayed in management list
 } custMgmContext_t, *custMgmContext_p;
 ```
 
-Each entry in the global management list (`customSelL`) is a `custMgmContext_t`. The `proc` function pointer is what allows different custom types (car parts vs. car prototypes) to coexist — each calls back into its own specialized handler.
+The `name` field identifies what type of custom data is being edited (e.g., "Turnout", "Car Part"). The `proc` callback dispatches operations like edit, delete, get title. The `f` file handle is used when writing the custom data back to a parameter file.
 
 ---
 
-## Core Functions
+## Key Functions
 
-### `CustomEdit(action)` — Open Edit Dialog for Selected Item
-
-1. Checks that exactly one item is selected; returns early otherwise
-2. Gets the context via `wListGetItemContext()` from the list widget
-3. Calls the registered callback's `CUSTMGM_DO_EDIT` handler (which opens a dialog specific to that type)
-4. On old code path (disabled), would call `GET_TITLE` and update the list entry
-
----
-
-### `CustomNewCar(action)` — Create a New Custom Item
-
-Opens a dialog to create a new custom part or prototype:
+### Custom Management Initialization
 
 ```c
-switch(selectedType) {
-    case 1:   // Car Prototype
-        CarDlgAddProto();   // from dcar.c
-        break;
-    case 0:   // Car Part
-        CarDlgAddDesc();    // from car.c (or similar)
-        break;
+EXPORT addButtonCallBack_t CustMgmInit(void)
+{
+    ParamRegister(&custMgmPG);
+    RegisterChangeNotification(CustMgmChange);
+    return &DoCustMgm;
 }
 ```
 
-The `selectedType` is set via a dropdown in the dialog to let the user choose what kind of item they want to create.
+Registers the parameter group and change notification handler, returning a callback for attaching to tool buttons.
 
 ---
 
-### `CustomDelete(action)` — Delete Selected Custom Items
-
-1. Gets the count of selected items
-2. Shows confirmation: "Are you sure you want to delete the N custom part(s)?"
-3. If confirmed, starts an undo transaction with label "delete"
-4. Iterates through all selected entries in the list
-5. For each one: calls its `CUSTMGM_DO_DELETE` callback (sets segment count to 0), frees memory, removes from widget list
-6. Ends undo transaction
-7. Triggers a change notification
-
----
-
-### `CustomExport(action)` — Export Selected Items to Parameter File
-
-Opens a file selector (`wFilSel`) and then calls `CustomDoExport()`. That function:
-
-1. Checks if the target file already exists; if not, prompts for a contents label
-2. If the file exists but isn't writable, shows an error message
-3. Opens the file in append mode (`"a"`)
-4. Writes a header line with optional UTF-8 conversion (if compiled with `UTFCONVERT`)
-5. Iterates through selected items and calls their `CUSTMGM_DO_COPYTO` callback:
-   - For turnout/structure custom parts, this writes the definition to the file
-   - For car prototypes/parts, similar write logic exists in `dcustmgm.c` or `dcar.c`
-6. Calls each item's `DO_DELETE` handler (removes from memory)
-7. Closes the file and reloads the parameter file so changes take effect
-
----
-
-### `CustomDone(action)` — Save All Custom Items to Default File
-
-Called when the user clicks "OK" on the management dialog without selecting specific items:
+### Element Registration
 
 ```c
-FILE * f = OpenCustom("w");   // opens custom.xtp in write mode
-CompoundCustomSave(f);        // writes all compound (turnout/structure) definitions
-CarCustomSave(f);             // writes all car prototype/part definitions
-fclose(f);
+EXPORT void CustMgmLoad(
+    wIcon_p icon,
+    custMgmCallBack_p proc,
+    void *data
+)
+{
+    custMgmContext_p context;
+    context = MyMalloc(sizeof *context);
+    context->proc   = proc;
+    context->data   = data;
+    context->icon   = icon;
+    context->name   = "Custom";  // Default name (set by caller)
+
+    if (data != NULL) {
+        context->proc(CUSTMGM_GET_TITLE, context->data);
+    } else {
+        context->name = MyStrdup(_("Unknown"));
+    }
+
+    wListAddValue(custSelL, message, icon, context);
+}
 ```
 
-This is essentially a "save all" operation that persists the user's custom creations to disk.
+Registers a custom-manageable object. The callback (`proc`) and data pointer are stored for later dispatch of edit/delete operations. If no valid object is registered (e.g., no turnouts/structures defined), the name becomes "Unknown".
 
 ---
 
-### `CustMgmLoad(icon, proc, data)` — Register a Custom Type
-
-Called by sub-modules (e.g., `CompoundCustMgmLoad()` from `dcmpnd.c`) when they want to add themselves to the management system:
+### Management Dialog Update
 
 ```c
-context = MyMalloc(sizeof *context);
-context->proc = proc;    // pointer to callback function with CUSTMGM_* operations
-context->data = data;     // opaque pointer (e.g., pointer into a sorted array)
-context->icon = icon;     // widget icon for UI display
-context->proc(CUSTMGM_GET_TITLE, context->data);  // get label text
-wListAddValue(customSelL, message, icon, context); // add to the global list
+static void CustMgmChange(long changes)
+{
+    if ((changes & CHANGE_PARAMS) == 0 ||
+        custMgmPG.win == NULL || !wWinIsVisible(custMgmPG.win)) {
+        return;
+    }
+
+    LoadCustMgmList();  // Rebuild the list
+}
 ```
 
-The `data` pointer is typically a pointer into a sorted array (e.g., an entry in a `dynArr_t`) so that lookups can be done by binary search.
+Rebuilds the management list whenever parameter changes are detected (e.g., a custom turnout was deleted). The `changes` mask is checked for `CHANGE_PARAMS`.
 
 ---
 
-### `LoadCustomMgmList()` — Refresh the Management List
+### Management Dialog Open
 
-Called after loading a layout file or when parameters change:
+```c
+static void DoCustMgm(void *junk)
+{
+    if (custMgmPG.win == NULL) {
+        ParamCreateDialog(&custMgmPG,
+                          MakeWindowTitle(_("Manage Custom Objects")),
+                          _("Done"), CustMgmDone,
+                          ParamCancel_Current, TRUE, NULL,
+                          F_RESIZE|F_RECALLSIZE|F_BLOCK);
+    }
 
-1. Saves the current selection index
-2. Iterates through all entries and frees them (memory is reclaimed)
-3. Clears the widget list
-4. Calls sub-loaders in order: `CompoundCustMgmLoad()` then `CarCustMgmLoad()`
-5. Restores the selection index
+    LoadCustMgmList();  // Build list from all registered custom objects
+    wShow(custMgmPG.win);
+}
+```
 
----
-
-### `CustMgmChange(changes)` — Change Notification Handler
-
-Called when layout parameters are modified (e.g., a new file is loaded). It refreshes the management list if parameter changes occurred and the dialog isn't currently visible.
-
----
-
-### `DoCustomMgr(junk)` — Entry Point for Dialog Creation
-
-Creates or re-shows the "Manage custom designed parts" dialog:
-- If the param group doesn't exist yet, creates it with a dropdown of types to create
-- Loads all registered custom entries into the list widget
-- Shows the window
+Opens the management dialog. The `LoadCustMgmList()` function iterates over all registered custom objects (turnouts, car parts, etc.) and populates a drop-down list. Each entry stores its callback and data pointer in the item context for later dispatch.
 
 ---
 
-### `CustomMgrInit()` — Module Initialization
+### Editing an Object
 
-Registers the param group, registers change notifications, and returns the button callback function. This is called once at application startup (or when registering menu items).
+```c
+static void CustMgmEdit(void *action)
+{
+    custMgmContext_p context = NULL;
+    wIndex_t selcnt, cnt, inx;
+
+    if ((selcnt = wListGetSelectedCount(custSelL)) != 1) return;
+
+    for (inx=0; inx<cnt && !wListGetItemSelected(custSelL, inx); inx++);
+    if (inx >= cnt) return;
+
+    context = (custMgmContext_p)wListGetItemContext(custSelL, inx);
+    if (context == NULL) return;
+
+    // Dispatch to type-specific edit handler
+    context->proc(CUSTMGM_DO_EDIT, context->data);
+
+    // Refresh the list entry with new title
+    context->proc(CUSTMGM_GET_TITLE, context->data);
+    wListSetValues(custSelL, inx, message, context->icon, context);
+}
+```
+
+Dispatches to the stored callback for editing. The callback (e.g., `TurnoutEditProc`) opens a type-specific dialog where the user edits parameters and optionally adds custom data.
 
 ---
 
-## Design Decisions & Tradeoffs
+### Deleting an Object
 
-### Why a Callback Framework?
+```c
+static void CustMgmDelete(void *action)
+{
+    wIndex_t selcnt, cnt, inx;
+    custMgmContext_p context = NULL;
 
-The core management functions (`Edit`, `Delete`, `CopyTo`) are completely generic — they don't know anything about car parts or turnout definitions. They simply:
-- Retrieve the context from the widget list (which holds a pointer to the element's own structure)
-- Call the registered callback with a command code and data pointer
+    if ((selcnt = wListGetSelectedCount(custSelL)) <= 0) return;
 
-This allows new custom types to be added without modifying `dcustmgm.c` itself — just implement a matching `custMgmCallBack_p` function signature and call `CustMgmLoad()` from that module.
+    if (!NoticeMessage2(1, _("Delete %d custom object(s)?"), _("Yes"), _("No"), selcnt))
+        return;
 
-### Why Store Context in the Widget List?
+    cnt = wListGetCount(custSelL);
+    UndoStart(_("Custom Objects"), "delete");
 
-The widget list (`customSelL`) stores pointers into the element arrays (e.g., entries in `turnoutInfo_da`). This avoids needing to maintain a separate parallel index table. The context struct holds:
-- A pointer back to the original data structure (for editing/deletion)
-- An icon for UI display
-- A function pointer that knows how to operate on that specific entry
+    for (inx=0; inx<cnt; inx++) {
+        if (!wListGetItemSelected(custSelL, inx)) continue;
 
-### Why Delete Immediately After Copying?
+        context = (custMgmContext_p)wListGetItemContext(custSelL, inx);
+        context->proc(CUSTMGM_DO_DELETE, context->data);  // Type-specific delete handler
+        MyFree(context);
+        wListDelete(custSelL, inx);
+        inx--; cnt--;
+    }
 
-In `CustomExport()`, each item is copied to a file and then immediately deleted from memory. This keeps the in-memory database clean — custom items are "ephemeral" until explicitly saved to a `.xtp` file, at which point they're persisted externally and removed from XTrkCAD's RAM-resident database.
+    UndoEnd();
+    DoChangeNotification(CHANGE_PARAMS);
+}
+```
+
+Calls each object's delete callback (e.g., `TurnoutDelete` sets the turnout's segment count to zero). Deletions are wrapped in an undo transaction.
+
+---
+
+### Done / Close Handler
+
+```c
+static void CustMgmDone(void *junk)
+{
+    custMgmContext_p context = NULL;
+    wIndex_t linx, lcnt;
+
+    for (linx=0; linx<lcnt; linx++) {
+        context = (custMgmContext_p)wListGetItemContext(custSelL, linx);
+        if (context != NULL && context->name[0] == '\0') {
+            MyFree(context);
+            wListDelete(custSelL, linx);
+            linx--; lcnt--;
+        }
+    }
+
+    wHide(custMgmPG.win);
+}
+```
+
+Removes entries from the list that have an empty `name` field (indicating they were orphaned or invalidated). Then hides the dialog window.
+
+---
+
+## How It Works with Other Modules
+
+This file is a **thin wrapper** around type-specific implementations in other files:
+
+- **Turnouts/Structures**: Uses callbacks from `dcmpnd.c` (`TurnoutEditProc`, `TurnoutDelete`, etc.)
+- **Car Parts/Items**: Uses callbacks from `dcar.c` (e.g., `CarPartEditProc`)
+
+Each object type registers itself via `CustMgmLoad()` with a pointer to its own callback set. The framework code in `dcustmgm.c` never needs to know the concrete type — it just invokes `context->proc(CUSTMGM_DO_EDIT, context->data)`.
 
 ---
 
 ## Summary Table
 
-| Function | Purpose | Key Parameters |
-|----------|---------|----------------|
-| `CustomEdit(action)` | Open edit dialog for selected custom item; calls its DO_EDIT callback | unused action pointer (widget button) |
-| `CustomNewCar(action)` | Create a new custom part or prototype based on the currently selected type in dropdown | unused action pointer |
-| `CustomDelete(action)` | Delete all selected items from memory and from the widget list | unused action pointer |
-| `CustomExport(action)` | Export selected items to a parameter file; removes them from memory after writing | unused action pointer |
-| `CustMgmLoad(icon, proc, data)` | Register a custom type with the framework; add entry to management list | icon widget handle, callback function pointer, opaque data pointer |
-| `CustomDone(action)` | Save ALL custom items (compound parts and car prototypes) to default file | unused action pointer |
-| `LoadCustomMgmList()` | Refresh the management list by clearing and reloading entries from sub-modules | none |
-| `CustMgmChange(changes)` | React to parameter changes; refresh the list if needed | bitmask of changed parameters |
-| `DoCustomMgr(junk)` | Create/show the "Manage custom parts" dialog window | unused junk pointer |
-| `CustomMgrInit()` | Module initialization; registers param group and change handler | none |
+| Function | Purpose |
+|----------|---------|
+| `CustMgmInit()` | Initialize framework, register change notification |
+| `CustMgmLoad(icon, proc, data)` | Register a custom-manageable object with its callbacks |
+| `DoCustMgm(junk)` | Open the management dialog and build the list |
+| `CustMgmChange(changes)` | Rebuild list on parameter changes |
+| `CustMgmEdit(action)` | Dispatch edit operation to type-specific handler |
+| `CustMgmDelete(action)` | Delete selected objects with undo support |
+| `CustMgmDone(junk)` | Close dialog, clean up orphaned entries |
 
 ---
 
-## Summary
+## Domain & Design Notes
 
-| Category | Content |
-|----------|---------|
-| **Purpose** | Provide a generic framework for managing user-created (custom) parts and prototypes. Allows edit, delete, export operations without modifying the core manager code. |
-| **Domain** | Custom database: user-defined car parts, locomotive definitions, turnout/structure variants that aren't in any parameter file but exist only in memory until exported to a `.xtp` file |
-| **Key concept** | A **callback-based dispatch model**: each custom type registers its own handler function. The generic manager doesn't need to know the difference between a car part and a turnout — it just calls `context->proc(cmd, context->data)` and lets that function handle it. |
-| **Main entry points** | `CustMgmLoad()` — called by each sub-module when registering itself; `CustomMgrInit()` — module initialization; button callbacks (`Edit`, `Delete`, `Export`) — user-facing operations |
+- **Callback-driven dispatch**: Like `dcontmgm.c`, this uses a callback pattern. Each object type provides its own set of callbacks (`DO_EDIT`, `DO_DELETE`, `GET_TITLE`) that the framework invokes polymorphically through the stored function pointer.
+- **Change notification integration**: The `CustMgmChange` handler is wired into XTrkCAD's global change notification system, so the list automatically refreshes when objects are added/removed from parameter files.
+- **Undo support**: Deletions are wrapped in undo transactions (`UndoStart` / `UndoEnd`), allowing users to recover accidentally deleted custom objects.

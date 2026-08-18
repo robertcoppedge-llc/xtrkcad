@@ -1,166 +1,278 @@
-# dcontmgm.c — Layout Control Element Management
+# dcontmgm.c — Control Element Management Framework
 
 ## Overview
 
-`dcontmgm.c` provides **layout control element management** functionality. It manages a global list of "control elements" that are associated with layout objects (tracks, turnout motors, signals, sensors). These control elements serve as the bridge between physical layout components and external control software (DCC decoders, LCC event systems, etc.).
+`dcontmgm.c` provides a **generic management framework** for "layout control elements" in XTrkCAD. These are logical objects that bridge the CAD layout with external control software (LCC, DCC decoders, etc.). The file implements:
 
-The module itself is generic — it doesn't define specific element types. Instead, it provides a **callback-based framework** that other modules (e.g., `cswitchmotor.c`, `csignal.c`) plug into to register their own elements.
-
----
-
-## Core Concepts
-
-### Control Elements
-
-A control element represents an association between:
-- A **layout object** (a track segment, turnout motor, sensor location, etc.)
-- **Control data** — a text string or other payload that external software uses for I/O addressing, event routing, etc.
-
-Examples of what a control element might represent:
-| Element Type | Layout Association | Control Data Example |
-|---|---|---|
-| Switchmotor | A turnout motor track segment | `"DCC addr=23"` or `"LCC event=SWITCH_04"` |
-| Block (occupancy detector) | A block section | `"BLOCK_A1"` for occupancy detection software |
-| Signal sensor | A signal location | `"SIG_RED_A1"` for a red-light indication |
-
-The control data is essentially free-form text — XTrkCAD doesn't enforce any particular syntax. The external software (e.g., DCC controller, LCC network) parses it as needed.
+- A unified dialog-based management UI
+- A callback-driven architecture allowing different element types (blocks, switchmotors, sensors) to share the same management code
+- Undo support for deletions
+- Change notification integration with other modules
 
 ---
 
-### The Generic Callback Framework
+## What Are Control Elements?
 
-Each element type registers itself with the generic manager by calling `ContMgmLoad(icon, proc, data)` where:
-- `icon`: A widget icon (used in the dialog UI for visual identification)
-- `proc`: A function pointer that handles all operations (edit, delete, highlight, get title, etc.)
-- `data`: An opaque pointer passed through to each operation
+Control elements are **logical objects** associated with layout features but not physical track pieces. They include:
 
-The manager then presents a unified list view with "Edit" and "Delete" buttons.
+| Element Type | Purpose | Example Use Case |
+|--------------|---------|------------------|
+| Block | Occupancy detection zone | Detect train presence on a segment of track |
+| Switchmotor | Actuator command for turnout | Send LCC "throw" command to move a switch |
+| Signal | Signal aspect control | Display red/green/yellow aspect on DCC decoder |
+| Sensor | Input from external device | Read temperature, pressure, or other layout sensors |
+
+These elements contain **"scripts"** — free-form text that describes how the element interfaces with external software. XTrkCAD does **not** impose any syntax; it simply stores and associates these scripts with their corresponding layout features.
 
 ---
 
-## Data Structures
+## Core Architecture: Callback-Driven Context
 
-### `contMgmContext_t` — Element Registration Context
+The framework uses a **context pointer pattern** to route operations to type-specific implementations:
 
 ```c
 typedef struct {
-    contMgmCallBack_p proc;  // Function pointer: CONTMGM_DO_EDIT, DO_DELETE, GET_TITLE, etc.
-    void * data;             // Opaque pointer to the element's own structure
-    wIcon_p icon;            // Widget icon for display in the list
+    contMgmCallBack_p proc;  // Type-specific callback function
+    void *data;              // Pointer to type-specific data structure
+    wIcon_p icon;            // Icon for the UI list entry
 } contMgmContext_t, *contMgmContext_p;
 ```
 
-Each entry in the global management list (`controlSelL`) is a `contMgmContext_t` struct. The `proc` field points to a function that handles all operations on this particular element type. This allows multiple different element types (switch motors, sensors, etc.) to coexist in the same list while being handled by their own specialized code paths.
+The `contMgmContext_p` is stored as item context in a GTK list widget. Each element type (blocks, switchmotors, etc.) registers its own elements via:
+
+```c
+ContMgmLoad(wIcon_p icon, contMgmCallBack_p proc, void *data);
+```
+
+This single entry point handles registration for **all** control element types — the callback (`proc`) and data pointer are used to dispatch operations like `CONTMGM_DO_EDIT`, `CONTMGM_GET_TITLE`, etc.
 
 ---
 
-## Core Functions
+## Key Data Structures
 
-### `ContMgmLoad(icon, proc, data)` — Register an Element Type
+### Control Management Context
 
-Called when a layout file is loaded or when new elements are added. Registers a new element type with the management system:
-- Allocates a new context struct
-- Stores the callback function and associated data
-- Calls `GET_TITLE` to retrieve a label string (for display in the list)
-- Adds an entry to the global widget list
+| Field | Type | Description |
+|-------|------|-------------|
+| `proc` | `contMgmCallBack_p` | Callback function pointer (e.g., `BlockEditProc`) |
+| `data` | `void*` | Pointer to element-specific data structure |
+| `icon` | `wIcon_p` | Icon displayed in the management list |
 
----
+### Control List Data Structure
 
-### `ControlEdit(action)` — Open Edit Dialog for Selected Element
+```c
+static paramListData_t controlListData = { 10, 400, 3, controlListWidths, controlListTitles };
+```
 
-When the user clicks "Edit" on a selected element:
-1. Checks that exactly one item is selected; if not, returns early
-2. Retrieves the context via `wListGetItemContext()`
-3. Calls the registered callback's `CONTMGM_DO_EDIT` handler
-4. Calls `CONTMGM_GET_TITLE` to fetch the current value for pre-filling the dialog
-5. Sets the list entry with the new message and icon
-
----
-
-### `ControlDelete(action)` — Delete Selected Elements
-
-1. Gets the count of selected items
-2. If zero are selected, returns early
-3. Shows a confirmation dialog: "Are you sure you want to delete the N control element(s)?"
-4. On affirmative, starts an undo transaction with message "Control Elements" (action="delete")
-5. Iterates through all selected entries in the list, calling each context's `CONTMGM_DO_DELETE` handler
-6. Frees the context struct and removes it from the widget list
-7. Ends the undo transaction
-8. Triggers a change notification (`CHANGE_PARAMS`) so dependent views refresh
+Where:
+- `10` — initial capacity of the list
+- `400` — column widths array size (columns: "Name", "Tracks")
+- `3` — number of columns
+- `controlListWidths[]` = `{ 18, 100, 150 }` — per-column widths
 
 ---
 
-### `ControlDone(action)` — Close the Dialog
+## Key Functions
 
-Called when the user clicks "OK" without making changes or when closing the dialog:
-- If any element is currently highlighted (via a HILIGHT callback), it calls each context's unhighlight handler to clear visual feedback
-- Hides the dialog window
+### Control Management Initialization
 
----
+```c
+EXPORT addButtonCallBack_t ControlMgrInit(void)
+{
+    ParamRegister(&controlPG);
+    RegisterChangeNotification(ContMgmChange);
+    return &DoControlMgr;
+}
+```
 
-### `ControlDlgUpdate(pg, inx, valueP)` — Update Dialog State
-
-Called whenever the selection in the list changes. It:
-1. Returns early if the changed control isn't the element-list widget
-2. Loops through all items currently selected in the list
-3. For each one, toggles its HILIGHT/UN_HILIGHT callback on or off
-4. Enables/disables the "Edit" and "Delete" buttons based on whether any item is selected
-
----
-
-### `LoadControlMgmList()` — Refresh the Management List
-
-Called after a layout file load (or when parameters change). It:
-1. Saves the current selection index
-2. Iterates through all entries and frees them
-3. Clears the widget list
-4. Calls sub-loaders for each element type: `BlockMgmLoad()`, `SwitchmotorMgmLoad()`, `SignalMgmLoad()`, `SensorMgmLoad()`
-5. Restores the selection index
+Registers the parameter group, change notification handler, and returns a callback function that can be attached to a tool button (e.g., "Manage Controls" menu item).
 
 ---
 
-### `ContMgmChange(changes)` — React to Parameter Changes
+### Element Loading
 
-A change notification handler that refreshes the list when parameters are modified (e.g., a layout file is loaded or reloaded). If changes include parameter updates and the dialog isn't visible, it calls `LoadControlMgmList()`.
+```c
+EXPORT void ContMgmLoad(
+    wIcon_p icon,       // Icon for this element type
+    contMgmCallBack_p proc,  // Callback dispatcher
+    void *data         // Pointer to the first/representative data struct
+)
+```
+
+Registers a control element. The callback (`proc`) and data pointer are stored in the context. When an element is selected, these are used to dispatch operations like editing or deletion.
 
 ---
 
-### `DoControlMgr(junk)` — Entry Point for Dialog Creation
+### Management Dialog Update
 
-Called from the button handler to create/show the management dialog. It creates the param dialog (if not already created), clears the list, then loads all registered element types via their respective load functions.
+```c
+static void ControlDlgUpdate(paramGroup_p pg, int inx, void *valueP)
+{
+    contMgmContext_p context = NULL;
+    wIndex_t selcnt = wListGetSelectedCount(controlSelL);
+    wIndex_t linx, lcnt;
+
+    if (inx != I_CONTROLLIST) { return; }  // Only react to list selection changes
+
+    // Toggle highlight on selected items, un-highlight others
+    for (linx=0; linx < lcnt; linx++) {
+        if (wListGetItemSelected(controlSelL, linx)) {
+            context = (contMgmContext_p)wListGetItemContext(controlSelL, linx);
+            context->proc(CONTMGM_DO_HILIGHT, context->data);
+            AnyHILIGHT = TRUE;
+        } else {
+            context = (contMgmContext_p)wListGetItemContext(controlSelL, linx);
+            context->proc(CONTMGM_UN_HILIGHT, context->data);
+        }
+    }
+
+    // Enable/disable Edit/Delete buttons based on selection count
+    ParamControlActive(&controlPG, I_CONTROLEDIT,  selcnt > 0);
+    ParamControlActive(&controlPG, I_CONTROLDEL,   selcnt > 0);
+}
+```
+
+This is the glue function that:
+- Highlights selected elements in the list (via callbacks)
+- Enables/disables Edit/Delete buttons based on whether any element is selected
 
 ---
 
-### `ControlMgrInit()` — Module Initialization
+### Editing an Element
 
-The module's initialization function that:
-- Registers the param group with its controls
-- Registers a change notification handler so the list refreshes when needed
-- Returns the button callback to be registered in a toolbar/menu
+```c
+static void ControlEdit(void *action)
+{
+    contMgmContext_p context = NULL;
+    wIndex_t selcnt = wListGetSelectedCount(controlSelL);
+    wIndex_t inx, cnt;
+
+    if (selcnt != 1) { return; }  // Must have exactly one selection
+
+    cnt = wListGetCount(controlSelL);
+    for (inx=0; inx<cnt && !wListGetItemSelected(controlSelL, inx); inx++);
+    if (inx >= cnt) { return; }
+
+    context = (contMgmContext_p)wListGetItemContext(controlSelL, inx);
+
+    // Dispatch to type-specific edit handler
+    context->proc(CONTMGM_DO_EDIT, context->data);
+
+    // Update the list entry with the new title (e.g., edited name or aspect string)
+    context->proc(CONTMGM_GET_TITLE, context->data);
+    wListSetValues(controlSelL, inx, message, context->icon, context);
+}
+```
+
+The framework **does not** perform editing itself. Instead, it calls the registered element's callback with `CONTMGM_DO_EDIT`, which then opens a type-specific dialog (e.g., "Edit Block" for blocks, "Edit Switchmotor" for switchmotors). After editing completes, `CONTMGM_GET_TITLE` is called to refresh the list display.
+
+---
+
+### Deleting Elements
+
+```c
+static void ControlDelete(void *action)
+{
+    wIndex_t selcnt = wListGetSelectedCount(controlSelL);
+    wIndex_t inx, cnt;
+    contMgmContext_p context = NULL;
+
+    if (selcnt <= 0) { return; }
+
+    // Confirm deletion with user
+    if (!NoticeMessage2(1, _("Are you sure..."), _("Yes"), _("No"), selcnt)) {
+        return;
+    }
+
+    cnt = wListGetCount(controlSelL);
+    UndoStart(_("Control Elements"), "delete");
+
+    for (inx=0; inx<cnt; inx++) {
+        if (!wListGetItemSelected(controlSelL, inx)) continue;
+
+        context = (contMgmContext_p)wListGetItemContext(controlSelL, inx);
+        context->proc(CONTMGM_DO_DELETE, context->data);  // Type-specific delete handler
+        MyFree(context);
+        wListDelete(controlSelL, inx);
+        inx--; cnt--;
+    }
+
+    UndoEnd();
+    DoChangeNotification(CHANGE_PARAMS);
+}
+```
+
+Deletion is wrapped in an undo transaction. Each element type handles its own cleanup (e.g., freeing allocated memory associated with the element).
+
+---
+
+### Done / Close Handler
+
+```c
+static void ControlDone(void *action)
+{
+    contMgmContext_p context = NULL;
+    wIndex_t linx, lcnt;
+
+    // Un-highlight all elements before closing dialog
+    if (AnyHILIGHT) {
+        for (linx=0; linx<lcnt; linx++) {
+            context = (contMgmContext_p)wListGetItemContext(controlSelL, linx);
+            context->proc(CONTMGM_UN_HILIGHT, context->data);
+        }
+    }
+
+    wHide(controlPG.win);  // Hide the dialog window
+}
+```
+
+---
+
+### Change Notification Handler
+
+```c
+static void ContMgmChange(long changes)
+{
+    if (changes) {
+        if (changed) {
+            changed = checkPtMark = 1;
+        }
+    }
+
+    // If no parameter change or dialog not visible, bail out
+    if ((changes & CHANGE_PARAMS) == 0 ||
+        controlPG.win == NULL || !wWinIsVisible(controlPG.win)) {
+        return;
+    }
+
+    LoadControlMgmList();  // Rebuild the list from current state
+}
+```
+
+This handler is registered via `RegisterChangeNotification()`. It rebuilds the management list whenever parameter changes are detected (e.g., a new block was added, or an element's script was modified). The `changes` bitmask indicates what kind of change occurred.
 
 ---
 
 ## Summary Table
 
-| Function | Purpose | Key Parameters |
-|----------|---------|----------------|
-| `ContMgmLoad(icon, proc, data)` | Register an element type with the management system; add entry to global list | icon widget handle, callback function pointer, opaque data pointer |
-| `ControlEdit(action)` | Open edit dialog for selected element; calls its GET_TITLE handler and sets pre-filled values | unused action pointer (widget button) |
-| `ControlDelete(action)` | Delete selected elements one-by-one via their DO_DELETE callbacks | unused action pointer |
-| `ControlDone(action)` | Clean up highlights and hide the management dialog window | unused action pointer |
-| `ControlDlgUpdate(pg, inx, valueP)` | Refresh button states and highlight state based on current selection | param group pointer, control index |
-| `LoadControlMgmList()` | Load all registered element types into the global list; called after file load | none |
-| `ContMgmChange(changes)` | React to parameter changes by reloading the list if needed | bitmask of changed parameters |
-| `DoControlMgr(junk)` | Create and show the management dialog window | unused junk pointer |
-| `ControlMgrInit()` | Module initialization; registers param group, change handler, returns button callback | none |
+| Function | Purpose | Key Notes |
+|----------|---------|-----------|
+| `ControlMgrInit()` | Initialize the management framework | Registers param group and change handler; returns callback for tool button |
+| `ContMgmLoad(icon, proc, data)` | Register a control element type or instance | Callback-driven registration pattern |
+| `ControlDlgUpdate(pg, inx, valueP)` | Handle list selection changes (highlight, enable buttons) | Iterates all items and calls their highlight callbacks |
+| `ControlEdit(action)` | Open edit dialog for selected element | Uses the stored callback to dispatch to type-specific handler |
+| `ControlDelete(action)` | Delete selected elements with undo support | Calls each element's delete callback; frees memory |
+| `ControlDone(action)` | Close dialog, un-highlight, hide window | Ensures clean state before closing |
+| `ContMgmChange(changes)` | Rebuild list on parameter changes | Called from change notification system |
 
 ---
 
-## Summary
+## Domain & Design Notes
 
-| Category | Content |
-|----------|---------|
-| **Purpose** | Provide a generic framework for managing control elements (switch motors, block sensors, signal indicators) that associate external control data with layout objects |
-| **Domain** | Layout control system integration: bridging physical track elements to digital control signals and I/O addresses used by external software |
-| **Key concept** | A **generic callback-based framework**: element types register themselves by providing a function pointer that handles all operations (edit, delete, get title). The manager doesn't need to know the specific type — it just calls through the registered callbacks. This allows adding new element types without modifying the core management code. |
-| **Main entry points** | `ContMgmLoad()` — register an element type; `DoControlMgr()` / button callback — open the dialog; each element type must provide a function matching the `contMgmCallBack_p` signature to handle edit/delete/get title/highlight operations |
+- **Callback-driven architecture**: This is the key design pattern. Every element type (blocks, switchmotors, sensors) registers its own set of callbacks (`CONTMGM_GET_TITLE`, `CONTMGM_DO_EDIT`, `CONTMGM_GET_TITLE`, `CONTMGM_UN_HILIGHT`, etc.). The framework code doesn't need to know about any specific element type — it simply invokes the stored callback pointer.
+
+- **Change notification integration**: The `ContMgmChange` handler is wired into XTrkCAD's global change notification system (via `RegisterChangeNotification`). This means that whenever *any* parameter file changes are detected, the control management list is automatically refreshed without requiring explicit refresh calls from elsewhere in the codebase.
+
+- **Highlighting**: The `AnyHILIGHT` flag and `CONTMGM_DO_HILIGHT` / `CONTMGM_UN_HILIGHT` callbacks provide a generic way for element types to highlight themselves on the layout canvas when selected in the dialog (e.g., dimming tracks associated with a block, highlighting a turnout controlled by a switchmotor).
+
+- **Undo support**: Deletions are wrapped in an undo transaction (`UndoStart` / `UndoEnd`). This allows users to undo accidental deletions via XTrkCAD's undo system.

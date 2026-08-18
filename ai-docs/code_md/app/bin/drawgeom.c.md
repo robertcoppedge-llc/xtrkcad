@@ -1,212 +1,239 @@
-# drawgeom.c — Drawing Operations (Lines, Arcs, Polygons, Anchors)
+# drawgeom.c — Drawing Geometry Commands (Lines, Polygons, Arcs, Boxes, Fills)
 
 ## Overview
 
-`drawgeom.c` implements **interactive drawing primitives** using an event-driven state machine. It handles mouse-down/move/up events to create lines, arcs, circles, filled shapes, polygons, and benchwork annotations. The module also provides a rich set of visual anchors that give user feedback about what actions are available via double-click or right-click menus.
+`drawgeom.c` implements the interactive drawing system for creating geometric primitives in XTrkCAD. It handles:
+
+- **Straight lines** (`SEG_STRLIN`)
+- **Dimension lines** (`SEG_DIMLIN`)
+- **Bench marks** (`SEG_BENCH`)
+- **Table edges** (`SEG_TBLEDGE`)
+- **Circular arcs** (`SEG_CRVLIN`, `SEG_FILCRCL`) — full and partial circles
+- **Polygons** (`SEG_POLY`, `SEG_FILPOLY`) — free-form, open polyline, rectangle
+- **Bezier curves** (via delegate)
+
+The file implements a state machine that responds to mouse actions: start, down, move, up, confirm/cancel. It uses temporary segment arrays (`tempSegs_da` and `anchors_da`) for intermediate geometry display during the drawing process.
 
 ---
 
-## Core Design Pattern: State Machine Drawing
+## Core Data Structures
 
-The drawing system uses a **state machine** (`drawContext_t`) to track multi-step operations. Each operation has discrete states:
-- `State == 0` — Idle / waiting for initial click
-- `State == 1` — Dragging (update live preview)
-- `State == 2` — Command complete, awaiting final confirmation
+### `drawContext_t` — Drawing Context Structure
+
+The main state container passed to all drawing functions:
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `State` | int | Current step in the draw sequence (0=ready, 1=drawing, 2=done) |
+| `Op` | long | Operation type (`OP_LINE`, `OP_CIRCLE1`, etc.) — encodes which shape and sub-mode |
+| `radius` | double | Current radius of circle/arc being drawn |
+| `angle` | float | Angle for line/drag direction |
+| `length` | DIST_T | Computed length of current segment |
+| `ArcData` | struct | Holds center, radius, a0/a1 angles for arc creation |
+| `type`, `subtype`, `filled`, `open` | — | For polygon: shape type and fill state |
 
 ---
 
-## Structures
+### `drawModContext_t` — Modification Context
 
-### `drawContext_t` — Drawing Operation State Machine
+Used when modifying existing objects. Contains the original segment pointers (`segPtr`) and offset/rotation information needed to map user edits back into the track structure.
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `orig`, `angle` | coOrd, ANGLE_T | Origin point and rotation angle for the object being modified |
+| `segPtr` | trkSeg_p* | Array of pointers to original segments in the track |
+| `prev_inx`, `max_inx` | int | Previous index and maximum index within a polygon |
+
+---
+
+### PolyState / PolyInx — Polygon Edit State
 
 ```c
-typedef struct {
-    enum OpType op;                 // Current operation type (line, circle, poly, etc.)
-    int state;                      // State: 0=idle, 1=dragging, 2=complete
-    BOOL_T started;                 // TRUE if mouse-down event was seen
-    BOOL_T changed;                 // TRUE if user modified geometry since last start
-    BOOL_T undo_started;            // TRUE if UndoStart() was called for this op
-    coOrd pos[4];                  // Accumulated point history (for polygons)
-    DIST_T radius;                  // Current radius value (circles, arcs)
-    ANGLE_T angle;                  // Current angle value
-    DIST_T length;                  // Current segment length
-    curveData_t arcData;           // Curve fitting data (center, radius, a0, a1)
-} drawContext_t, *drawContext_p;
+typedef enum {POLY_NONE, POLY_SELECTED, POLYPOINT_SELECTED} PolyState_e;
+static PolyState_e polyState = POLY_NONE;
+static coOrd rotate_origin;
+static ANGLE_T rotate_angle;
 ```
 
-| Field | Description |
-|-------|-------------|
-| `op` | Operation type: line, circle, filled circle, polygon, bench, etc. |
-| `state` | Current state in the operation lifecycle |
-| `started` | Whether this command has received a mouse-down event yet |
-| `changed` | Flag indicating geometry was modified (triggers undo recording) |
-| `undo_started` | Whether an undo transaction was begun for this operation |
-| `pos[]` | History of cursor positions; used to detect polygon closure and compute segment angles |
-| `radius` | Live radius value being dragged by the user |
-| `angle` / `length` | Live angle/length values for dimension lines, benchwork, etc. |
-| `arcData` | Computed curve parameters (center point, radius, start/end angles) used during drag preview and finalization |
+Tracks whether the user is in point-selection mode (moving polygon vertices) or origin/rotation mode.
 
 ---
 
-### `polyState_e` — Polygon Selection State
+## Command Mode Enumerations
 
-```c
-typedef enum { POLY_NONE, POLY_SELECTED, POLYPOINT_SELECTED } polyState_e;
-```
+### `OP_*` — Drawing Operations
 
-Tracks whether a polygon vertex is currently selected for modification.
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `OP_LINE` | 1 | Draw a straight line segment |
+| `OP_DIMLINE` | 2 | Dimension line (parallel guide) |
+| `OP_BENCH` | 3 | Bench mark symbol |
+| `OP_TBLEDGE` | 4 | Table edge indicator |
+| `OP_CIRCLE1` / `OP_FILLCIRCLE1` | 5/6 | Full circle, fill color variant |
+| `OP_CIRCLE2` / `OP_FILLCIRCLE2` | 7/8 | Radius drag mode (center locked) |
+| `OP_CIRCLE3` / `OP_FILLCIRCLE3` | 9/10 | Center click then radius drag mode |
+| `OP_CURVE1..4` | 11–14 | Curved track creation modes (delegate to `ccurve.c`) |
+| `OP_BOX` / `OP_FILLBOX` | 15/16 | Rectangle/freeform polygon, with or without fill |
+| `OP_POLY` / `OP_FILLPOLY` | 17/18 | Free-form polygon creation (click points) |
+| `OP_POLYLINE` | 19 | Open polyline (no closing required) |
 
----
-
-## Key Functions
-
-### `DrawGeomMouse(wAction_t action, coOrd pos, drawContext_t *context)`
-
-Main entry point invoked from the command dispatcher on every mouse event during drawing mode. Dispatches based on `action` type (`C_START`, `wActionLDown`, `wActionLDrag`, `wActionLUp`, etc.) and the current operation type.
-
-**Returns:** `STATUS_T` — one of:
-- `C_CONTINUE` — keep processing events in this command
-- `C_TERMINATE` — finish the drawing command, finalize geometry
-- `C_ERROR` — error occurred (e.g., polygon too few sides)
-
----
-
-### State Machine Behavior
-
-#### On `wActionLDown` / `wActionRDown` (Mouse Button Pressed)
-
-1. Reset temporary segment array (`tempSegs_da`) and anchors
-2. Initialize state to 0 (idle), set `started = TRUE`
-3. For most operations, store the first click as both endpoints (`pos0 = pos1 = pos`)
-4. Set up operation-specific initial behavior:
-
-   | Operation | Behavior on first click |
-   |-----------|-------------------------|
-   | Line, benchwork, table edge | Ready to drag second point; shows length/angle feedback |
-   | Circle 1 / FilledCircle 1 | Show "Drag to set radius" cursor hint |
-   | Box / FillBox | Create a 4-segment rectangle from the single point (all sides zero-length) |
-   | Polygon | Ready for first point; next points extend the polygon chain |
+The first digit of the operation code distinguishes shape type; the last two digits distinguish variants.
 
 ---
 
-#### On `wActionLDrag` / `wActionRDrag` (Mouse Dragged)
+## Core Functions
 
-This is where live preview happens. The behavior differs by operation:
+### `EndPoly(context, cnt, open)` — Finalize a Polygon
 
-- **Line / Benchwork** — updates `.pos[1]` to current cursor position; shows length/angle tooltip
-- **Circle 2** — sets radius = distance from pos0 to current mouse position
-- **Curve1–4** — uses `PlotCurve()` (from `ccurve.c`) to compute the circular arc that fits between pos0 and current position with given radius; draws preview arcs and shows red arrowheads for interactive adjustment
-- **Polygon** — appends a new straight segment to the polygon chain; detects closure when mouse returns near starting point
+When a polygon draw action ends, this function:
+- Validates that at least 3 points exist (otherwise issues an error)
+- Creates a dynamic array of point structures (`pts_t`) from the internal buffer
+- Constructs a single segment with type `SEG_POLY` or `SEG_FILPOLY` and stores the point array
 
----
-
-#### On `wActionLUp` / `wActionRUp` (Mouse Button Released)
-
-Finalizes the geometry:
-
-1. If operation is in state 2 (complete), calls `DrawGeomOk()` to write segments into a track and record undo
-2. For lines/arcs/polygons, computes final values (angle = arctan2(dy,dx))
-3. Detects **polygon closure** — if the last segment endpoint is within `eps` of the first point, closes the polygon by linking back to start
+**Parameters:**
+- `context`: The drawing context holding temporary geometry
+- `cnt`: Number of vertices in the polygon
+- `open`: TRUE for open polyline (`POLYLINE`), FALSE for closed free-form polygon
 
 ---
 
-## Operation Types (`enum OpType`)
+### `DrawGeomOk(started)` — Commit Segments to Track
 
-| Constant | Meaning | Shape Produced |
+Called when the user finishes a draw operation (click-up or OK). For each segment currently held in `tempSegs_da`, it calls `MakeDrawFromSeg()` to create a real track segment and draws it. If `started` is FALSE, an undo transaction is started first.
+
+---
+
+### `CreateEndAnchor(pos, lock)` — Create Anchor Marker for Curved Tracks
+
+Creates a small circular arc centered at `pos` (radius ≈ 7.5 units) that marks where a curve endpoint is being defined. Blue if free to move; red if locked (`lock=TRUE`). Used during interactive curved track creation.
+
+---
+
+### `CreateLineAnchor(p, p0)` — Create Line Endpoint Anchor
+
+Creates two small arcs centered at `p` and an additional arc from `p` toward `p0`. Used in line drawing to indicate the current endpoint position relative to the starting point (`p0`).
+
+---
+
+### `CreateSquareAnchor(pos)` — Create Square Marker for Polygon Edges
+
+Creates four arrow-like segments arranged into a square around `pos`, indicating that this edge of a polygon is selected and can be moved. Used during polygon vertex editing.
+
+---
+
+### `FindTempNear(context, p)` — Point-in-Curve/Line Test
+
+A "near" test: determines whether the mouse position lies close to an existing temporary segment (either on a line or circular arc). Returns TRUE if within a small tolerance. This is used for snapping during drag operations.
+
+---
+
+### `DrawGeomMouse(action, pos, context)` — Main Drawing Dispatcher
+
+The central function that dispatches all drawing actions based on the current operation (`context->Op`). It handles mouse up/down/move events and updates the temporary geometry buffer accordingly.
+
+**Key modes handled:**
+- Lines: draw a segment from one point to another; show length/angle feedback
+- Circles: center-click then radius-drag, or tangent-point method
+- Rectangles: click two opposite corners; also supports fill toggle
+- Polygons: click successive vertices until closing the shape
+
+---
+
+### `DrawGeomPolyModify(action, pos, context)` — Polygon Vertex Editing Mode
+
+When a polygon is already drawn and the user enters edit mode (double-click), this function handles:
+- **Point selection:** clicking near a vertex selects it for movement; new points can be inserted between edges
+- **Dragging:** moving a selected point updates neighboring edge lengths and angles, preserving adjacent edge constraints
+- **Delete/Backspace:** removes the most recently added point if at least 3 vertices remain
+- **Vertex type switching:** 'o'/'s'/'v'/'r' keys switch between smooth, straight, and round corners
+
+---
+
+### `DrawGeomOriginMove(action, pos, context)` — Move Rotation Origin / Translate Object
+
+Used when a user wants to reposition the "pivot point" of an object (e.g., for rotating about a different center). The origin is shown as a crosshair marker; selecting a new origin changes where rotations/transformations are applied.
+
+---
+
+### `DrawGeomModify(action, pos, context)` — Unified Modify Dispatcher
+
+The top-level modify function that dispatches to sub-handlers based on the segment type (`SEG_STRLIN`, `SEG_CRVLIN`, `SEG_POLY`, etc.). It handles:
+- **Line endpoints:** drag to move; Ctrl+Shift locks to 90° relative angle from previous line (useful for perpendicular offsets)
+- **Circle arcs:** dragging center changes radius; dragging an endpoint changes the swept arc angle while preserving radius; holding Shift preserves radius and only changes start/end angles
+- **Polygons:** vertex selection, edge dragging with right-angle constraint (Ctrl key), corner point movement
+
+---
+
+## Geometry Helper Functions
+
+### `CreateCurveAnchors(index, pm, pc, p0, p1)`
+
+Creates anchor markers for a curved arc:
+- An arc at the center (`pc`) if the segment is a full circle
+- Two arcs at the endpoints (`p0`, `p1`) indicating sweep direction
+- An arrow marker at the midpoint (`pm`) indicating the bisector of the arc
+
+The index parameter selects which anchor type to draw (center vs. endpoint).
+
+---
+
+### `CreateCircleAnchor(selected, center, radius, angle)`
+
+Creates a small arc centered on a circle's center point that indicates where the current sweep angle points. Used during circle creation and editing.
+
+---
+
+### `BuildCircleContext(context, segInx)` — Prepare Circle Edit Context
+
+Computes the midpoint of an existing circular segment (`pm`), its center (`pc`), and stores them in the context so they can be used for interactive editing. Computes the start angle (`a0`) and end angle (`a1`) from the stored geometry.
+
+---
+
+### `CreateMovingAnchor(pos, fill)` — Temporary Anchor During Drag
+
+Creates a small circular arc centered at `pos`. If `fill` is TRUE, uses an inner radius (`d/4`) to show it's the currently-selected point being dragged. Used during drag operations when no specific anchor type exists.
+
+---
+
+## State Machine Summary
+
+The drawing system operates as a finite state machine:
+
+| Action | Typical Effect |
+|--------|---------------|
+| `C_START` | Reset context; set up message or cursor; initialize undo start flag |
+| `wActionMove` (drag) | Update preview geometry in `tempSegs_da`; show anchors; update info message with current length/angle/radius |
+| `wActionLDown` / `wActionRDown` | Lock first point (`pos0 = pos`); switch to drawing state (`State=1`) |
+| `C_MOVE` | Continue dragging: compute next segment, validate nearness to existing geometry, show preview |
+| `C_UP` | Finalize the object; create undo transaction if needed; return control |
+| `C_CONFIRM` / `C_OK` | Same as C_UP but with explicit user confirmation (e.g., from a dialog) |
+
+The `State` field in the context tracks: 0 = idle, 1 = drawing (preview), 2 = finalized.
+
+---
+
+## Summary Table
+
+| Function | Purpose | Key Parameters |
 |----------|---------|----------------|
-| `OP_LINE` | Simple line between two points | Straight track centerline |
-| `OP_DIMLINE` | Dimension/annotation line | Same as OP_LINE but with different color and no undo |
-| `OP_BENCH` | Benchwork annotation | Straight segment with material data |
-| `OP_TBLEDGE` | Table edge marker | Special annotation for tabletop modeling |
-| `OP_CURVE1` | Drag from endpoint (curvature varies along arc) | Circular arc with varying curvature |
-| `OP_CURVE2` | Drag from tangent angle | Circular arc, radius set by cursor distance |
-| `OP_CURVE3` | Drag from center point | Circular arc centered at first click |
-| `OP_CURVE4` | Drag from chord midpoint | Circular arc via chord-midpoint method |
-| `OP_CIRCLE1` | Fill a circle (closed filled shape) | Filled circular region |
-| `OP_CIRCLE2` | Draw an arc (not filled) | Open circular arc |
-| `OP_CIRCLE3` | Arc with radius set by drag distance | Same as OP_CIRCLE2 but radius from pos0→pos1 |
-| `OP_FILLBOX` | Filled rectangle | Rectangular polygon region |
-| `OP_BOX` | Empty (outline-only) rectangle | Polygon without fill |
-| `OP_POLY` / `OP_POLYLINE` | Open or closed arbitrary polygon | User draws freeform shape; Enter/Tab closes it |
-| `OP_FILLPOLY` | Filled arbitrary polygon | Same as POLY but with filled interior |
+| `EndPoly(context, cnt, open)` | Finalize a polygon; create point array and track segment | context, vertex count, boolean for polyline vs closed |
+| `DrawGeomOk(started)` | Commit all segments in the temp buffer to real tracks | started flag (undo needed?) |
+| `CreateEndAnchor(pos, lock)` | Draw a small circular marker at a curve endpoint | coordinate, lock boolean |
+| `CreateLineAnchor(p, p0)` | Mark a line's current endpoint relative to its start | current point, starting point |
+| `CreateSquareAnchor(pos)` | Create four-segment square marker for polygon edge selection | center coordinate |
+| `FindTempNear(context, p)` | Test if mouse is close to any existing temp segment | context, test point; returns boolean |
+| `DrawGeomMouse(action, pos, context)` | Main entry; dispatches based on operation type and action | action code, mouse position, context pointer |
+| `DrawGeomPolyModify(action, pos, context)` | Handle polygon vertex selection and movement during edit mode | action, position, modify context |
+| `DrawGeomOriginMove(action, pos, context)` | Move the rotation/translation origin for an object | action, position, context |
+| `DrawGeomModify(action, pos, context)` | Unified dispatcher for all drawing operations (lines, arcs, boxes) | action, position, context |
 
 ---
 
-## Anchor System
+## Summary
 
-Anchors are small graphical overlays drawn in a separate dynamic array (`anchors_da`) on top of the drawing canvas. They appear only during an active drawing session and disappear when the command completes or is cancelled. Each anchor is itself a `trkSeg_t` describing lines/arcs that visually indicate what actions are available via double-click/right-click.
-
-### `CreateEndAnchor(coOrd p, wBool_t lock)`
-
-Draws a small filled circle (if `lock == TRUE`) or open arc at point `p`. Used to mark locked endpoints of arcs/circles — the anchor signals "this endpoint is already connected and cannot be moved freely."
-
----
-
-### `CreateLineAnchor(coOrd p, coOrd p0)`
-
-Draws a line from cursor position `p` back to the first click (`p0`) with an arrowhead. Used during circle-creation mode to show the radius direction.
-
----
-
-### `CreateSquareAnchor(coOrd p)`
-
-Draws four outward-pointing arrows arranged as a square around point `p`. Signals that this object can be translated (moved) by dragging.
-
----
-
-### `CreateCurveAnchors(int index, coOrd pm, coOrd pc, coOrd p0, coOrd p1)`
-
-Draws three small filled circles:
-- One at the arc center (`pc`) with an arrow pointing toward the curve
-- Two at each endpoint of the arc (`p0`, `p1`), each showing a perpendicular tangent indicator
-The red/blue coloring differentiates which anchor is active for interaction.
-
----
-
-### `CreateBoxAnchors(int index, pts_t pt[4])`
-
-For rectangles, draws:
-- A central small circle indicating the center point (selectable to rotate)
-- Four corner circles with outward arrows indicating draggable corners
-- Diagonal arcs connecting opposite corners showing the rectangle is a single selectable object
-
----
-
-### `CreatePolyAnchors(int index)`
-
-Draws anchors for each vertex of a polygon:
-- A small filled circle centered on each vertex (selectable to move that point)
-- If two adjacent points are selected, an arc between them indicates they can be dragged together as a side
-The red/blue coloring distinguishes the currently active anchor.
-
----
-
-### `CreateMovingAnchor(coOrd pos, BOOL_T fill)`
-
-Draws a small circle with (optionally) an inner filled center to indicate the object is in "move" mode — typically used when the user has invoked the move/transform command and is about to drag an object around.
-
----
-
-## Utility Functions
-
-### `FindTempNear(drawContext_t *context, coOrd *p)`
-
-For operations that have a live preview (curves, lines, etc.), this returns TRUE if the current cursor position lies within a small tolerance (`eps`) of the currently drawn geometry. This is used to determine whether to lock the cursor to the nearest point on the curve/line during dragging.
-
----
-
-### `CleanSegs(drawContext_t *context)`
-
-Called when starting a new drawing operation: resets the temporary segment array, clears anchor arrays, and prepares for fresh input.
-
----
-
-## Related Files
-
-| File | Purpose |
-|------|---------|
-| `drawgeom.h` | Type definitions for draw contexts, operation enums |
-| `track.h` / `cstruct.c` | Track/segment data structures (`trkSeg_t`, track list) |
-| `ccurve.c/ccurve.h` | Curve-fitting math (used by OP_CURVE* operations) |
-| `tbezier.c/tbezier.h` | Bezier approximation utilities for curved tracks |
-| `cdraw.c` | Drawing routines that consume the segment data produced here |
+| Category | Content |
+|----------|---------|
+| **Purpose** | Implement an interactive drawing system that lets users create lines, circles, polygons, and other geometric primitives by clicking and dragging on the screen. It also supports editing existing objects (moving endpoints, resizing arcs, moving polygon vertices). |
+| **Domain** | Interactive computer graphics / CAD geometry modeling: mouse-driven shape creation with immediate visual feedback through temporary buffers (`tempSegs_da`, `anchors_da`). |
+| **Key concept** | The system uses a state machine (`context->State`) and a dynamic array of segments (`tempSegs_da`) to show a live preview as the user drags. The preview is never part of the track database until `C_UP` or `C_OK` commits it. Anchors (small arcs/lines) are drawn to indicate which parts of the object are being edited and in what direction. |
+| **Main entry points** | `DrawGeomMouse()` — called from the main event loop for drawing operations; `DrawGeomModify()` — called when modifying an existing track segment |
