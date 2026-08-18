@@ -1,25 +1,70 @@
-# Application Reference Documentation (Current State)
+# Application Reference Documentation
 
-## Overview
+## 🏗️ Architecture Overview
 
-The xtrkcad application is a robust, procedural C-based geometry tool designed for CAD drawing and path generation. The codebase demonstrates a highly modular structure, allowing specific functionalities to be developed and maintained in isolation.
+XTrackCAD follows a layered, modular architecture designed for cross-platform compatibility and high mathematical precision. The application separates high-level user interface concerns from low-level geometric calculations and system-specific abstractions.
 
-### 📂 Directory Structure Analysis
+### 📂 Directory Structure & Modules
 
-The source code is separated into key functional modules:
-*   **`cornu/`**: Core business logic. Contains domain-specific algorithms like Bezier Curve context management and Spiro Spiral path generation. This is the geometric brain of the application.
-*   **`wlib/`**: Utility Library. Houses fundamental building blocks, abstract data types, system utilities, and general math helper functions. This module should be treated as a shared infrastructure layer.
-*   **`lib/`**: Application glue code, containing primary resources (`*.desktop`, `xtrkcad.ini`) and the main build targets that assemble all other modules into a runnable application.
+#### 1. Presentation Layer (`app/bin/`)
+The entry point and UI orchestration module.
+*   **Core UI Logic**: Manages the main window, menu systems, toolbars, and user input handling.
+*   **Command Pattern**: Implements an undo/redo system (via `cundo.c`) to manage complex drawing operations.
+*   **UI Components**: Contains specialized widgets and dialogs for selecting paths, parameters, and views.
+*   **Resource Management**: Handles icon loading, menu definition, and interface localization.
 
-### 🧱 Key Functional Components
+#### 2. Logic Layer (`app/cornu/`)
+The geometric "brain" of the application. This module is platform-agnostic and focuses purely on mathematical modeling.
+*   **Bezier Context (`bezctx`)**: Manages the state and lifecycle of Bezier curve geometry, handling creation, manipulation, and conversion.
+*   **Spiro Spiral Generator (`spiro`)**: Implements algorithms for generating spiro spiral paths using point-based data.
+*   **Geometric Kernels**: Contains the mathematical primitives required for path generation and shape manipulation.
 
-#### 1. Core Geometry Processing (Cornu)
-*   **Bezier Context (`bezctx`)**: Manages the state and lifecycle of Bezier curve geometry, handling creation, manipulation, and conversion to the final format (`xtrkcad_to_xtrkcad`). This object maintains the context needed for drawing complex paths.
-*   **Spiro Spiral Generator (`spiro`)**: Implements complex mathematical algorithms to generate spiro spiral paths. It manages point data (`spiro_cp`, `spiro_seg`) and can convert its output into a format usable by Bezier contexts.
+#### 3. Abstraction Layer (`app/wlib/`)
+Provides a cross-platform hardware and OS abstraction layer.
+*   **`gtklib/`**: GTK+ 2.0 abstraction for Linux/Unix-based systems.
+*   **`mswlib/`**: Microsoft Windows-specific implementation of the windowing and UI abstraction.
+*   **`include/`**: Platform-independent headers and utility definitions used by both GTK and MSW implementations.
 
-#### 2. Utility Library (WLib)
-*   Provides general-purpose, reusable utilities across the application. These include math functions, resource loaders, and cross-platform helper routines. This library is foundational to the entire system's operation.
+#### 4. Utility & Foundation Layer
+Low-level, reusable modules that support the entire application stack.
+*   **`cJSON/`**: A lightweight, embedded JSON parsing library for data interchange.
+*   **`dynstring/`**: Dynamic string management utilities.
+*   **`app/lib/`**: Application-wide resources, including configuration (`.ini`), parameter templates (`.xtp`), and desktop integration files.
+*   **`app/tools/`**: Development and auxiliary tools (e.g., Halibut for documentation, image converters).
 
-### ✨ Usage Notes for New Developers
-*   **Build Process**: The project relies on CMake (`CMakeLists.txt`) to link these modules together correctly. Understanding the dependency graph defined by the `CMake` directory is essential before modifying any source code.
-*   **Execution Flow**: A typical drawing operation begins in the UI layer, passes a request (e.g., 'draw Bezier curve') to the `BezContext` module, which then utilizes functions from the `UtilityLibrary` and potentially the `SpiroGenerator` to calculate the final geometry.
+---
+
+## 📚 Library Reference
+
+### 🛠️ Internal Libraries
+
+| Library | Scope | Purpose |
+| :--- | :--- | :--- |
+| **`cornu`** | Logic | Core geometric algorithms (Bezier, Spiro, etc.). |
+| **`wlib`** | Abstraction | Cross-platform UI and system abstraction (GTK/Win32). |
+| **`cJSON`** | Utility | Embedded JSON processing. |
+| **`dynstring`** | Utility | Dynamic memory-managed string operations. |
+| **`i18n`** | Localization | Internationalization and translation management. |
+
+### 🌐 External Libraries
+
+| Library | Category | Usage in XTrackCAD |
+| :--- | :--- | :--- |
+| **GTK+ 2.0** | UI Toolkit | Primary toolkit for the Linux/Unix graphical interface. |
+| **Zlib** | Compression | Used for data compression and decompression. |
+| **Libzip** | Archiving | Handles compressed archive files. |
+| **MiniXML** | Serialization | Enables SVG export functionality. |
+| **CMocka** | Testing | Unit testing framework for verifying geometric and logic components. |
+| **Doxygen** | Documentation | Automates technical API documentation generation. |
+| **Pandoc** | Documentation | Converts Markdown documentation to other formats. |
+| **FreeImage** | Graphics | Cross-platform bitmap/image export (primarily on Windows). |
+| **Gettext** | Localization | Standard toolset for handling translated strings. |
+
+---
+
+## ✨ Developer Guidelines
+
+*   **Geometry First**: When adding new shapes or paths, prioritize implementation in the `cornu/` module to ensure platform independence.
+*   **Platform Agnosticism**: Any new UI component should be implemented in `wlib/include/` first, then specialized in `gtklib/` (Linux) and `mswlib/` (Windows).
+*   **Testing**: New logic modules should include corresponding unit tests using the `CMocka` framework.
+*   **Build System**: All dependencies and linking rules are managed via `CMake`. Modifications to the build system should be reflected in the `CMakeLists.txt` files throughout the tree.
