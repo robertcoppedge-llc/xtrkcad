@@ -1,212 +1,170 @@
-# cmodify.c — Track Modification Operations
+# cmodify.c — Track Modify Command (Extend/Alter Tracks, Rulers, Bezier/Cornu Modification)
 
 ## Overview
 
-`cmodify.c` implements the **Modify** command, which provides a unified interface for several track editing operations:
-- **Trimming/shortening** a track from either end (the "basic" modify operation)
-- **Extending** a track by appending straight or curved segments with optional easement transitions
-- **Modifying Bézier control points** (delegates to `cbezier.c`)
-- **Modifying clothoid endpoints** (delegates to `ccornu.c`)
-- **Modifying Draw objects** (basic shape editing)
+`cmodify.c` implements the **Modify** command in XTrkCad. It allows users to:
+- Extend a track with straight or curved segments (with optional easement curves).
+- Alter an existing track by changing its length.
+- Modify rulers, Bezier tracks, Cornu spiral tracks, and DRAW objects.
+- Add flexible ("flextrack") extensions using Ctrl+Right-click on a turnout end.
 
-The command uses a state machine driven by mouse events (`C_START`, `C_DOWN`, `C_MOVE`, `C_UP`, etc.) and keyboard modifiers (`Shift`, `Ctrl`, `Alt`). Undo support is integrated via `UndoStart()`/`UndoModify()`/`UndoEnd()`.
+The core function is `CmdModify(action, pos)` which dispatches on mouse actions (`C_START`, `C_DOWN`, `C_MOVE`, `C_UP`, `C_OK`, etc.) to perform the appropriate modification operation.
 
----
+## File Location
 
-## Data Structures
+```
+app/bin/cmodify.c
+```
 
-### `Dex` — Global Modification State
+## Includes & Dependencies
+
+| Header | Purpose |
+|--------|----------|
+| `cjoin.h` | Track joining utilities (`ConnectTracks`, `JoinTracks`) |
+| `ccurve.h` | Curve drawing helpers (`NewCurvedTrack`, `PlotCurve`) |
+| `cbezier.c` | Bezier curve track modification |
+| `ccornu.h` | Cornu spiral track handling |
+| `cstraigh.h` | Straight track creation/adjustment |
+| `cundo.h` | Undo stack management (`UndoStart`, `UndoEnd`, `UndoModify`) |
+| `fileio.h` | I/O utilities |
+| `param.h` | Parameter dialog framework (used for easement length input) |
+| `track.h` | Track data structures and accessor functions |
+| `drawgeom.h` | Geometric drawing primitives (`DrawEndPt`, `DrawArrowHeads`) |
+| `common.h` | Common utilities (`MyMalloc`, `InfoMessage`, etc.) |
+| `layout.h` | Layout state (pan center, zoom extents) |
+| `cselect.h` | Object selection helpers |
+| `common-ui.h` | UI widget types (`wMenu_p`, `wAction_t`) |
+| `draw.h` | Drawing context (`mainD.d`, drawing functions) |
+
+## Main External Variable
+
+```c
+EXPORT wIndex_t modifyCmdInx;   /* index of "Modify" in the main command menu */
+```
+
+## Enums Used
+
+### `curveType_e`
+Represents the type of curve being extended:
+
+| Value | Name | Description |
+|-------|------|-------------|
+| `curveTypeStraight` | Straight | A straight segment extension |
+| `curveTypeNone` | None / Back | No valid curve selected (cancel) |
+| `curveTypeCurve` | Curve | A circular arc extension |
+
+## Structs & Data Members
+
+### `Dex` — Global modification state struct
 
 ```c
 static struct {
-    track_p Trk;                       // The currently selected track being modified
-    trackParams_t params;              // Extended parameters for extend mode (curve type, radius, length)
-    coOrd pos00, pos00x, pos01;        // Points: original endpoint, preview position, drag start
-    ANGLE_T angle;                     // Current tangent angle at the modified end
-    curveData_t curveData;             // Computed data for curves being extended
-    easementData_t jointD;             // Easement computation results (for curved extensions)
-    DIST_T r1;                         // Radius of a circular arc extension candidate
-    BOOL_T valid;                      // TRUE if the current preview is geometrically valid
-    BOOL_T first;                      // Flag for "first move after initial click" in extend mode
+    track_p Trk;                /* currently modified track */
+    trackParams_t params;       /* extended track parameters (type, arcR, len) */
+    coOrd pos00;                /* original end point before drag started */
+    coOrd pos00x;               /* temporary scratch coordinate */
+    coOrd pos01;                /* previous position during drag (for animation) */
+    ANGLE_T angle;              /* current tangent angle at the extend point */
+    curveData_t curveData;      /* computed curve data from endpoint + radius/angle */
+    easementData_t jointD;      /* easement joint geometry (d0, d1, x, flip, etc.) */
+    DIST_T r1;                  /* transition arc radius for composite curves */
+    BOOL_T valid;               /* is the current extended segment valid? */
+    BOOL_T first;               /* flag: are we at the start of a drag operation? */
 } Dex;
 ```
 
-`Dex.Trk` holds a pointer to the track currently being modified. All modification state (preview points, computed curves, easement data) is accumulated here across multiple mouse events until the user confirms or cancels with `C_UP`.
-
-### `tempSegs_da` — Temporary Segment Array
-
-A dynamically allocated array of `trkSeg_t` used to hold preview segments for the "Extend" operation. When the user drags in extend mode, preview segments are appended here and drawn (in black) as a visual guide before confirmation.
-
-### `anchors_da` — Anchor Points
-
-```c
-static dynArr_t anchors_da;  // Array of trkSeg_t used to draw small circular handles at endpoints
-#define anchors(N) DYNARR_N(trkSeg_t,anchors_da,N)
-```
-
-Each element is a tiny circular arc segment (radius ≈ 0.15 × scale) drawn in blue. Anchors are placed around an endpoint to allow the user to drag them and adjust:
-- **Radius** — by dragging along the radial direction
-- **Angle / position** — by dragging tangentially
-
-Anchors appear for both Bézier control points (`SEG_FILCRCL` with a radius handle) and clothoid endpoints.
-
-### `log_modify` — Logging Channel
-
-```c
-static int log_modify;  // Global log index used by LOG(...) macros
-```
-
-The `LOG(log_modify, level, "...")` macro emits messages to the application's logging system (e.g., for debugging or audit trails).
-
----
+### `anchors_da` (dynArr)
+A dynamic array used to draw temporary anchor arcs when dragging endpoints or radius anchors. Each element represents a small arc centered at an endpoint with radius equal to half the track gauge, drawn in blue (`wDrawColorBlue`). Used for visual feedback during interactive modification.
 
 ## Core Functions
 
-### `CreateEndAnchor(coOrd p, wBool_t lock)` — Create a Circular Handle at an Endpoint
+### `CmdModify(wAction_t action, coOrd pos)`
+The main dispatch function handling all modify operations. Dispatches on mouse events:
 
-Creates a small circular anchor segment centered at `p`. Used around clothoid endpoints that can be resized. The handle is drawn as a tiny blue circle (radius ≈ 0.15 × scale) with zero line width so it only appears when selected or hovered.
+| Action | Behavior |
+|--------|----------|
+| `C_START` | Initialize the command — show message "Select a track to modify..." |
+| `C_DOWN / C_LDOUBLE` | Left-click or double-click on a track endpoint (or ruler/protractor) |
+| `C_RDOWN` / `C_MOVE` (with Ctrl held) | Extend track with straight or curved extension; drag the end point |
+| `C_RUP` | Accept the extended segment and commit to undo stack |
+| `C_MOVE` (no Ctrl, on a DRAW object) | Drag an endpoint of a DRAW object |
+| `C_UP` | Commit modification to Undo stack, redraw track |
+| `C_TEXT` / `C_OK` | Confirm/apply changes for Bezier/Cornu/DRAW modifications |
+| `C_TERMINATE` | Terminate the modify session (e.g., after Ctrl+RDOWN or "Enter") |
 
-### `CreateCornuAnchor(coOrd p, wBool_t lock)` — Create Two Anchors for a Clothoid Endpoint
+### Internal Sub-functions
 
-Creates **two** small circular anchors around a clothoid endpoint:
-- **Inner anchor:** smaller circle used to adjust the radius of the end segment (straight vs. curved transition)
-- **Outer anchor:** larger ring used to adjust the tangent angle at the end
+#### `ModifyBezier(wAction_t action, coOrd pos)`
+Delegates to `cbezier.c`'s `CmdBezModify`. Handles control point editing for Bezier track segments. Sets global flags (`modifyBezierMode`) and handles mouse events including drag, confirm (Enter), cancel, and termination.
 
-The two rings are drawn concentrically; dragging along one or the other changes different parameters. The `lock` flag controls whether the handle is "locked" (fixed while dragging another point) or free.
+#### `ModifyCornu(wAction_t action, coOrd pos)`
+Delegates to `ccornu.c`'s `CmdCornuModify`. Handles editing Cornu spiral endpoints. Supports dragging endpoints and terminating with Enter or clicking outside.
 
-### `CreateRadiusAnchor(coOrd p, ANGLE_T a, BOOL_T bi)` — Create an Arrow Handle for Radius Adjustment
+#### `ModifyDraw(wAction_t action, coOrd pos)`
+Handles point-based modification of DRAW objects (free-form drawn lines). Allows adding/removing points by left-clicking to place new points. Terminates on Enter/Shift+Enter.
 
-Creates five polyline segments forming an arrow-shaped handle around an endpoint's radial adjustment ring:
-- The center circle indicates the current radius
-- An outer ring allows changing from straight (`r=0`) to curved
-- The arrow shape visually encodes "pull outward = increase radius" and "push inward = decrease radius"
+## Modify Command Modes
 
-The `bi` flag controls whether the inner or outer ring of the handle is highlighted.
+The command supports several interaction modes distinguished by flags and actions:
 
----
+| Mode | Flag / Key | Trigger |
+|------|------------|----------|
+| **Track modify** (trim) | Left-click on track endpoint | Extends or truncates the selected track |
+| **Flextrack extend** | Ctrl + Right-click on turnout end | Adds a straight extension with an easement curve |
+| **Ruler mode** | Shift + Left-click on ruler | Modifies the ruler's scale/tick marks |
+| **Protractor mode** | Left-click on protractor arc | Adjusts angle markings |
+| **Bezier modify** | Query returns `Q_CAN_MODIFY_CONTROL_POINTS` | Edit Bezier control points |
+| **Cornu modify** | Query returns `Q_IS_CORNU` | Edit Cornu spiral parameters |
 
-### `ModifyBezier(wAction_t action, coOrd pos)` — Delegate Bézier Editing to cbezier.c
+## Track Queries Used (from `track.h`)
 
-This function acts as a thin wrapper around `CmdBezModify()` from `cbezier.c`. It:
-1. Sets `trackGauge` based on the selected track (or zero if not a valid track)
-2. Passes the current mouse action and position to the Bézier modifier state machine
-3. On termination (`C_TERMINATE`), resets global flags and clears `Dex.Trk`
+```c
+BOOL_T  QueryTrack( track_p t, int q );   // check track property
+TRACK_P OnTrack(coOrd *pos, BOOL_T canExtend, BOOL_T canModify);
+TRACK_P OnTrackSilent(...);                // no InfoMessage if fails
 
-Bézier modification allows moving control points of a spline-defined track segment, effectively reshaping that portion of the layout interactively.
+BOOL_T CheckTrackLayer(track_p trk);       // must not be frozen or module-only
+BOOL_T CheckTrackLayerSilent(...);          // silent version
 
----
+#define Q_CAN_MODIFY_CONTROL_POINTS  ...   // is a Bezier segment?
+#define Q_IS_CORNU                   ...    // is a Cornu spiral?
+#define Q_IS_DRAW                    ...    // is a DRAW object?
+#define Q_CAN_EXTEND                ...    // can this end be extended?
+```
 
-### `ModifyCornu(wAction_t action, coOrd pos)` — Delegate Clothoid Editing to ccornu.c
+## Geometry: Computing an Extended Segment
 
-Similar wrapper around `CmdCornuModify()` from `ccornu.c`. The clothoid modifier state machine handles:
-- Selecting and dragging endpoint adjustment anchors (radius/angle rings)
-- Adding/removing interior G2 anchor points along the curve
-- Validating that the resulting geometry is geometrically feasible
+When extending with a curve, the following steps occur (simplified):
 
----
+1. **Compute joint geometry** — find where the easement arc meets the existing track and the new circular arc. This uses `ComputeJoint(arcR, r1, &jointD)` which solves for the tangent point between two circles of radii `arcR` and `r1`.
+2. **Clip to minimum length** — if the extended segment is shorter than `minLength`, an error message appears.
+3. **Build track segments**:
+   - If straight: create a `SEG_STRTRK` with endpoints at the original end and the new computed point.
+   - If curved: create a `SEG_CRVTRK` with center, radius, start angle (`a0`), and sweep angle (`a1`).
+4. **Connect** the old track to the new segment via `ConnectTracks(oldTrk, epIdx, newTrk, inx)`.
 
-### `ModifyDraw(wAction_t action, coOrd pos)` — Modify a Draw Object
+## Includes (utility.h is implicitly included via other headers)
 
-A generic modifier for objects of type `DRAW`. These are free-form polygonal shapes (not tracks) that can be used as obstacles or decorative elements. The function handles:
-- **C_START/C_DOWN** — select the object and show bounding box hilite
-- **C_MOVE** — drag vertices (with preview geometry shown in black)
-- **C_UP / C_OK** — commit changes; call `ModifyTrack()` which updates the track's segment array
-- **C_CANCEL** — discard pending edits
+```c
+#include "cjoin.h"
+#include "ccurve.h"
+#include "cbezier.h"
+#include "ccornu.h"
+#include "cstraigh.h"
+#include "cundo.h"
+#include "fileio.h"
+#include "param.h"
+#include "track.h"
+#include "drawgeom.h"
+#include "common.h"
+#include "layout.h"
+#include "cselect.h"
+#include "common-ui.h"
+#include "draw.h"
+```
 
-The function also handles keyboard shortcuts: typing `'0'` or `'o'` enters a "select mode" (likely for multi-object selection), `'c'` centers the view, `'s'` zooms to extents.
+## Notes
 
----
-
-### `ModifyTrack(track_p trk, wAction_t action, coOrd pos)` — The Generic Track Modifier
-
-This is the central dispatcher for basic track modification operations (trimming). It handles:
-- **C_START / C_DOWN** — select a track and show message "Select a track to modify..."
-- **wActionMove** — snap position to nearest point on a selected track, draw preview hilite rectangles showing where trimming would occur
-- **C_MOVE** — continue dragging the preview; the preview rectangle moves along the track
-- **C_UP / C_OK** — commit: compute how much to trim, adjust `Dex.Trk`'s endpoint coordinates, update undo history via `UndoModify()`, call `UndoEnd()`
-- **C_TERMINATE** — discard pending changes
-
-The trimming logic (not fully shown in the excerpt) computes a new endpoint coordinate and updates the track object accordingly.
-
----
-
-### `CmdModify(wAction_t action, coOrd pos)` — Main Entry Point
-
-This is the top-level state machine that routes to sub-handlers depending on:
-- Whether the user has selected a track (`Dex.Trk != NULL`)
-- Which modifier mode is active (Bezier, Cornu, Draw, Extend, Ruler, Protractor)
-- The current mouse action (`C_START`, `C_DOWN`, `C_MOVE`, etc.)
-
-**Key modes:**
-
-| Mode | Trigger | Behavior |
-|------|---------|----------|
-| **Extend track** (`Ctrl+RightClick`) | Right-click on a track with Ctrl held | Enters extend mode: user drags to define an endpoint, chooses straight or curved extension, optionally adds easement transition. Preview segments are drawn in black. On release, the new segment is inserted and connected via `ConnectTracks()` or `JoinTracks()` (if easement). |
-| **Radius handle** (`Shift+LeftClick` on a track with open end) | Left-click while Shift held | Creates radius/angle adjustment anchors around an endpoint. Dragging adjusts the curve's radius at that end. |
-| **Turnout extend** (`Ctrl+RightClick` on turnout) | Right-click on a turnout with Ctrl held | Extends one of the turnout's open ends, optionally inserting a curved transition arc. |
-| **Bezier control point edit** | Left-click on Bézier track | Delegates to `ModifyBezier()`. Control points are moved interactively. |
-| **Clothoid endpoint adjustment** | Left-click on clothoid track | Delegates to `ModifyCornu()`. Endpoint handles allow radius/angle tweaking. |
-
-**Extend mode algorithm (detailed):**
-
-1. User right-clicks a track with Ctrl held → enter extend mode (`Dex.first = TRUE`).
-2. The endpoint coordinate is shown as a hilite rectangle. Dragging moves it along the tangent line at ±90° offsets from the current tangent direction.
-3. If the drag reaches within `minLength` of the original endpoint, abort (can't extend to zero length).
-4. On release (`C_UP`): compute the new track segment:
-   - **Straight extension:** create a straight segment between old and new endpoint.
-   - **Curved extension:** compute center and radius from two endpoints and tangent direction; generate a circular arc via `PlotCurve()` (calls into `cbezier.c`).
-5. Compute easement data (`jointD`) if needed — this determines where to insert a transition curve between the old track and the new segment.
-6. If there is no existing easement at that joint, simply connect with `ConnectTracks()`.
-7. If an easement exists, use `JoinTracks()` which inserts the transition geometry.
-
-**Easement computation:** When extending a curved track where an easement (clothoid) already exists at that end, the system computes how much of the easement must be "consumed" to connect smoothly to the new segment. The easement length is computed from the change in curvature (`dκ/ds`) and integrated along the arc.
-
----
-
-## Summary Table
-
-| Function | Purpose | Key Parameters |
-|----------|---------|----------------|
-| `CreateEndAnchor` | Create a small circular handle for endpoint radius adjustment | position, lock flag |
-| `CreateCornuAnchor` | Create two concentric handles (radius + angle) at a clothoid endpoint | position, lock flag |
-| `CreateRadiusAnchor` | Create arrow-shaped radial handle with inner/outer rings | position, angle, inner flag |
-| `ModifyBezier` | Delegate to Bézier editor (`cbezier.c`) | track pointer, action code, mouse pos |
-| `ModifyCornu` | Delegate to clothoid editor (`ccornu.c`) | track pointer, action code, mouse pos |
-| `ModifyDraw` | Edit Draw object vertices | action code, position |
-| `ModifyTrack` | Generic trim/modify dispatcher | track pointer, action code, position |
-| `CmdModify` | Main state machine for all modification operations | action code, mouse position |
-
----
-
-## Design Decisions & Tradeoffs
-
-### Why a Global State Structure (`Dex`) Instead of Passing Context?
-
-The modify command is invoked repeatedly (every mouse move event) while the user drags. Passing a large struct by value on every call would be inefficient and error-prone. Instead, `Dex` is a globally scoped static structure that persists across invocations. This is typical in GUI applications where event-driven code cannot easily maintain per-operation state on the stack (due to nested calls, interrupts from the windowing library, etc.).
-
-### Why Separate Preview from Commit?
-
-The preview geometry (`tempSegs_da`) is drawn but **not** committed until `C_UP` or `C_OK`. This allows the user to experiment with different extension lengths and types without immediately altering the layout. Undo support wraps the entire commit transaction, so if the user backs out before confirming, no changes are made.
-
-### Why Use Small Circular Anchors Instead of Larger Handles?
-
-Small anchors (radius ≈ 0.15 × scale) reduce visual clutter. They only become visible when the cursor hovers over them or is clicked on, keeping the workspace clean. The arrow-shaped radius handle uses a different shape because it needs to convey directionality ("pull outward") more clearly than a plain circle does.
-
-### Why Delegate to Submodules?
-
-The modify command delegates Bézier and clothoid editing to dedicated modules (`cbezier.c`, `ccornu.c`). This avoids duplicating complex state machines in one monolithic file. The delegate functions (`ModifyBezier`, `ModifyCornu`) simply set up their local sub-state (e.g., which control point is selected) and then pass the action through a switch statement back to the submodule's handler.
-
-### Why Compute Easement Data Inline?
-
-The easement computation is done inline in `CmdModify` because it depends on global state (`trackGauge`, `minLength`) and must integrate with the undo/redo system. The easement data structure (`easementData_t`) stores intermediate results of a geometric solver that determines how long a clothoid transition must be to connect two arcs smoothly. This is computed only when needed (i.e., when extending a curved track at an existing easement) to avoid unnecessary computation.
-
----
-
-## Summary
-
-| Category | Content |
-|----------|---------|
-| **Purpose** | Provide interactive modification of tracks: trim endpoints, extend with straight/curved segments, adjust Bézier control points, adjust clothoid parameters |
-| **Domain** | Interactive CAD editing; track geometry manipulation; undo-able state transitions |
-| **Key concept** | A global state structure (`Dex`) holds all pending modifications until the user confirms or cancels; preview geometry is drawn but not committed until `C_UP`/`C_OK` |
-| **Main entry point** | `CmdModify(wAction_t, coOrd)` — a large switch statement that dispatches based on active mode and mouse action |
+- The `Dex` struct is a single global instance shared across all threads; this is safe because the command is interactive and state changes are reflected immediately on the display.
+- `anchors_da` is used only during drag operations to show blue arcs around endpoints, giving visual feedback that an endpoint is being dragged.
+- The undo system (`UndoStart`, `UndoEnd`) wraps each successful modify operation so it can be undone via Ctrl+Z later.
