@@ -47,6 +47,12 @@
 | 34 | dxfformat.h | ✅ | Completed |
 | 35 | elev.c | ✅ | Completed |
 | 36 | fileio.c | ✅ | Completed |
+| 37 | file2uri.c | ✅ | Completed |
+| 38 | levenshtein.c | ✅ | Completed |
+| 39 | acclkeys.h | ✅ | Completed |
+| 40 | appdefaults.c | ✅ | Completed |
+| 41 | bdf2xtp.c | ✅ | Completed |
+| 42 | ctext.c | ✅ | Completed |
 
 ---
 
@@ -54,12 +60,11 @@
 
 | # | File | Status | Notes |
 |---|------|--------|-------|
-| 37 | file2uri.c | 🔴 | Not yet started |
 | ... | (remaining) | 🔴 | Not yet started |
 
 ---
 
 ## Summary
-- **Completed:** 36 files (≈60%)
+- **Completed:** 42 files (≈73%)
 - **Pending review:** 0 files
-- **Not yet started:** ~14 remaining files in app/bin/
+- **Not yet started:** ~9 remaining files in app/bin/
