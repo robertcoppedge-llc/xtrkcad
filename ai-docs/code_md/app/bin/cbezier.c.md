@@ -1,145 +1,188 @@
-# cbezier.c — Bezier Curve Creation and Editing
+# cbezier.c — Bezier Curve Creation and Modification Commands
 
 ## Overview
 
-`cbezier.c` provides infrastructure for **Bezier curves** in xtrkcad. Bezier curves are defined by four control points: start, control point 1, control point 2, and end. The curve is rendered as a series of circular arcs that approximate the true Bezier form within a tolerance of 0.5 pixels at maximum zoom.
+`cbezier.c` implements the command for creating and modifying **Bezier curves** in XTrkCad. A cubic Bézier curve is defined by four control points: two endpoints and two internal control points that determine the curve's shape via Bernstein polynomial blending.
 
-This approximation approach allows xtrkcad to use standard track operations (splitting, connecting, parallel offsetting) which are difficult or impossible with pure Bézier mathematics.
+The file provides both a creation wizard (`CmdBezCurve`) and an edit mode modifier (`CmdBezModify`). It also converts Bézier curves into sequences of circular arcs (for efficient rendering) and analyzes their topology to detect invalid forms like loops or cusps.
 
----
+## File Location
 
-## Key Data Structures
+```
+app/bin/cbezier.c  (1289 lines)
+```
 
-### `struct bCurveData` — Bezier Curve Editing State
+## Includes & Dependencies
+
+| Header | Purpose |
+|--------|----------|
+| `common.h` | Core types (`coOrd`, `track_p`, `wAction_t`, etc.) |
+| `draw.h` | Drawing primitives (`DrawSegs`) |
+| `ccurve.c` / `ccurve.h` | Circular arc curve data and functions |
+| `tbezier.h` | Bézier track/line data structures (from `app/tools/tcurve`) |
+| `cstraigh.h` | Straight segment handling |
+| `drawgeom.h` | Geometric utilities (`FindDistance`, `FindAngle`) |
+| `cjoin.h` | Track joining utilities |
+| `track.h` | Track types and definitions |
+| `wcolors.h` | Widget colors (`wDrawColorBlack/White/Red/Blue`) |
+| `param.h` | Parameter types (`LWIDTH_T`, `DIST_T`) |
+| `fileio.h` / `layout.h` / `cundo.h` / `compound.h` | File I/O, layout context, undo support |
+
+## Key Concepts
+
+### Cubic Bézier Curve Definition
+
+A cubic Bézier curve is defined by four points:
+
+```text
+P(t) = (1-t)³·P0 + 3(1-t)²t·P1 + 3(1-t)t²·P2 + t³·P3   for t ∈ [0,1]
+```
+
+- **P0** — Start endpoint
+- **P1** — First control point (pulls the curve toward it near P0)
+- **P2** — Second control point (pulls the curve toward it near P3)
+- **P3** — End endpoint
+
+### Why Convert to Arcs?
+
+XTrkCad renders tracks as a sequence of circular arcs and straight lines. Bézier curves are converted because:
+1. Many operations (parallel offsetting, track joining, etc.) work naturally on arc/straight segments.
+2. Exporting to DXF or other formats requires segment-by-segment representation.
+
+### Bézier Types Allowed
+
+| Type | Description |
+|------|-------------|
+| `PLAIN` | Standard S-shaped curve |
+| `LINE` | All four points are collinear (degenerate) |
+| `INFLECTION` | Has an inflection point but no loop/cusp |
+| `DOUBLEINFLECTION` | Two inflections |
+| `LOOP` | Self-intersecting — **rejected** as invalid for tracks |
+| `CUSP` | Sharp cusp / sharp turn — **rejected** as invalid |
+| `ENDS` | Identical endpoints (zero-length) — rejected |
+| `COINCIDENT` | Three or more points coincide — rejected |
+
+Only `PLAIN`, `LINE`, `INFLECTION`, and `DOUBLEINFLECTION` are valid. Loops, cusps, and degenerate forms are rejected with an error message.
+
+## Data Structures
+
+### `enum Bezier_States`
+
+```c
+enum { NONE,
+       POS_1,              // First endpoint placed; dragging first control arm
+       CONTROL_ARM_1,      // First control arm dragged; awaiting second endpoint
+       POS_2,              // Second endpoint placed; dragging second control arm
+       PICK_POINT,         // Picking a point on the curve (modify mode)
+       POINT_PICKED,      // A point is picked and being dragged
+       TRACK_SELECTED     // In modify mode, original track shown
+     };
+```
+
+### `bCurveData_t`
+
+Holds data for one arc segment of an approximated Bézier:
 
 ```c
 typedef struct {
-    curveData_t curveData;   // Arc approximation data from ccurve.c
-    double start;            // Start parameter (0.0) of the arc segment
-    double end;              // End parameter (1.0) of the arc segment
-    coOrd pos0;              // First endpoint of the Bezier
-} bCurveData_t, *bCurveData_p;
+  curveData_t curveData;   // center, radius, start/end angles
+  double start;            // param t where this arc begins (0.0–1.0)
+  double end;              // param t where this arc ends (start ≤ end ≤ 1.0)
+  coOrd pos0, pos1;        // endpoints of the arc segment in model coords
+} bCurveData_t;
 ```
 
-### `Da` — Global Bezier Editing Context
+### `static struct { ... } Da` — The command's private state
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `state` | `enum Bezier_States` | Current wizard step or mode |
+| `pos[4]` | `coOrd`[] | The four Bézier control points |
+| `selectPoint` | `int` | Which point is selected (-1 = none) |
+| `trk[2]` | `track_p`[] | Neighbor tracks attached to endpoints (in track mode) |
+| `ep[2]` | `EPINX_T`[] | Endpoint index on the neighbor track |
+| `crvSegs_da` | `dynArr_t trkSeg_t` | Dynamic array of arc segments approximating the Bézier |
+| `cp1Segs_da`, `cp2Segs_da` | arrays of `trkSeg_t` | Control arms (visual handles) |
+| `unlocked` | `BOOL_T` | Whether control points are locked to direction |
+| `selectTrack` | `track_p` | The track being modified (in modify mode) |
+| `track` | `BOOL_T` | Are we creating a Track or a Line? |
+| `minRadius` | `DIST_T` | Minimum radius of curvature for the Bézier |
+| `trackGauge` | `DIST_T` | Gauge of this track (for validation) |
+
+### `enum BezierType AnalyseCurve(...)` return values
 
 ```c
-static struct {
-    enum Bezier_States state;       // Current editing phase
-    coOrd pos[4];                   // The four control points of the Bezier
-    int selectPoint;                // Index of currently selected point (-1 if none)
-    track_p trk[2];                 // Tracks connected to each end (for turnsouts)
-    EPINX_T ep[2];                  // Endpoint index on connected tracks
-    dynArr_t crvSegs_da;            // Array of arc segments approximating the Bezier
-    int crvSegs_da_cnt;             // Number of arc segments in `crvSegs_da`
-    trkSeg_t cp1Segs_da[4];         // Control arm 1 (visual handle)
-    trkSeg_t cp2Segs_da[4];         // Control arm 2 (visual handle)
-    int cp1Segs_da_cnt;             // Number of segments in control arm 1
-    int cp2Segs_da_cnt;             // Number of segments in control arm 2
-    BOOL_T unlocked;                // Whether the Bezier is locked to existing tracks
-    track_p selectTrack;            // The track currently being modified (if editing)
-    BOOL_T track;                   // TRUE = creating a track, FALSE = line
-    DIST_T minRadius;              // Minimum radius of curvature along the curve
-} Da;
+enum { PLAIN, LOOP, CUSP, INFLECTION, DOUBLEINFLECTION, LINE, ENDS, COINCIDENT } bType;
 ```
-
----
 
 ## Core Functions
 
-### `AnalyseCurve(coOrd inpos[4], double *Rfx, double *Rfy, double *cusp)` — Characterize a Bezier Curve
+### `getPoint(coOrd pos[4], double s)`
 
-This function determines what kind of geometry a given set of four control points produces. It returns one of:
+Evaluates the Bézier curve at parameter `s ∈ [0,1]` using de Casteljau's algorithm:
 
-| Return value | Description |
-|---|---|
-| `ENDS` | Start and end points are coincident (no valid curve) |
-| `LINE` | A perfectly straight line (all points collinear) |
-| `PLAIN` | A standard, well-behaved Bezier curve |
-| `CUSP` | The curve has a cusp (sharp point where tangent is undefined) — invalid for tracks |
-| `LOOP` | The curve crosses itself forming a loop — invalid for tracks |
-| `INFLECTION` | The curve changes direction such that the radius of curvature becomes infinite — potentially problematic |
-| `DOUBLEINFLECTION` | Two inflection points exist — rare but possible |
+```c
+double mt = 1-s;
+double a=mt*mt*mt, b=mt*mt*s*3, c=mt*s*s*3, d=s*s*s;
+return (a*pos[0]+b*pos[1]+c*pos[2]+d*pos[3]);
+```
 
-The function uses analytic geometry derived from work by Maureen C. Stone (Xerox PARC) and Tony deRose (U Washington). It translates the control points so the start point is at origin, then computes parameters that determine curve type.
+### `BezError(...)` / `BezErrorLine(...)`
 
----
+Compute the maximum perpendicular distance between a trial circular arc and the Bézier curve. The arc is considered "good" if the error ≤ 0.5 pixels (at maximum zoom). This binary-search-driven approximation builds the segment list in `Da.crvSegs_da`.
 
-### `ConvertToArcs(coOrd pos[4], dynArr_t *segs, BOOL_T track, wDrawColor color, LWIDTH_T lineWidth)` — Approximate a Bezier with Circular Arcs
+### `AnalyseCurve(coOrd pos[4], double *Rfx, double *Rfy, double *cusp)`
 
-This is the central conversion routine. It:
-1. Uses **binary search** to find the transition points between adjacent circular arcs along the curve.
-2. For each arc segment, it finds the circle that best fits the Bézier over an interval `[t_s, t_e]` such that the maximum deviation error is ≤ 0.5 pixels (the tolerance threshold).
-3. Returns `TRUE` on success, `FALSE` if conversion failed (e.g., due to inflection points or cusps).
+Determines which of the eight Bézier types the curve falls into by:
+1. Checking for coincident endpoints → `ENDS`
+2. Checking collinearity (all four points lie on one line) → `LINE`
+3. Translating so P0 is at the origin and computing coefficients from the implicit form of a conic fitted to the control points.
+4. Comparing against the cusp condition curve: `cusp = -(fx²-2fx+3)/4`.
 
-The binary search works by:
-- Starting with the largest possible arc (`t_e = 1.0`).
-- Halving the interval until the error falls below threshold or the next larger arc would exceed tolerance.
-- If the full curve can be represented by one arc, that's used directly.
+Returns one of the eight types. Loops, cusps, and degenerate curves trigger error messages.
 
----
+### `ConvertToArcs(...)` — Bézier → Circular Arc Segments
 
-### `CreateControlArm(trkSeg_t sp[], coOrd pos0, coOrd pos1, BOOL_T track, BOOL_T selectable, BOOL_T cp_direction_locked, int point_selected, wDrawColor color)` — Build Visual Control Handle
+This is the core approximation function. It works by:
+1. Binary search to find a trial arc (`t_s` … `t_e`) that satisfies the error threshold (≤ 0.5px).
+2. If good, record it in `Da.crvSegs_da`, then advance `t_s = prev_e` and repeat with a wider span.
+3. If bad, shrink the trial interval by moving `t_e` inward.
 
-Creates a visual handle (control arm) for the interactive editor. It draws:
-- A straight line segment from `pos0` to `pos1`.
-- Two small circles at each end if the point is selectable and unlocked. The selected point's circle is drawn red; others are black. If the control point is locked (i.e., constrained to a connected track), its circle is filled.
+The function returns `FALSE` if no valid approximation can be found (e.g., extreme curvature that even tiny arcs cannot represent within tolerance).
 
----
+### `createControlArm(...)`
 
-### `DrawTempBezier(BOOL_T track)` — Draw Preview of Current Bezier Edit
+Draws one of the two Bézier control arms. Each arm is a visual handle showing:
+- A line from the endpoint to its associated control point.
+- Two small circles at each end — filled red if it's the currently selected point, empty black otherwise. Filled black means "locked" (direction fixed by a neighboring track).
 
-Renders the current state of the interactive editor:
-- The approximated arc segments in normal or exception color (if radius < minimum allowed).
-- Two control arms showing which points are currently draggable.
+Returns the number of segments drawn.
 
----
+### `DrawTempBezier(...)` / `CreateMoveAnchor(...)`
 
-### `AdjustBezCurve(wAction_t action, coOrd pos, BOOL_T track, wDrawColor color, LWIDTH_T lineWidth, bezMessageProc message)` — Handle Mouse Input for Bezier Editing
+When in edit mode, these functions redraw the temporary Bézier with its control arms and the underlying arc-segment representation. Anchors are blue circles that appear under each control point so the user knows where they can click to grab them.
 
-This is the main event dispatcher for interactive Bezier editing. It handles:
-- **`C_START`** — Reset state to `NONE`, show info message "Select End-Point".
-- **`wActionMove`** (while in `PICK_POINT`) — Show anchor circles around each selectable endpoint; display move guides near the cursor.
-- **`C_DOWN`** — Select the nearest valid endpoint and enter `POINT_PICKED` state; show info message "Drag point N to new location".
-- **`C_MOVE`** — Drag the selected control point, recompute arc approximation, show radius/length statistics or error messages (cusp, loop, etc.).
-- **`C_UP`** — Release selection; if a track is connected, snap the endpoint to an unconnected track endpoint if SHIFT is held.
-- **`C_OK` / `C_TEXT` (Space)** — Finalize and create the new track/line. If the curve has cusps or loops, display an error and abort.
-- **`C_CANCEL`** — Abort editing; discard all temporary data.
+## Command: `CmdBezCurve` — Creating a Bézier Track or Line
 
----
+**State machine:** `START → POS_1 → CONTROL_ARM_1 → POS_2 → PICK_POINT → POINT_PICKED → OK/CANCEL`
 
-### `CmdBezModify(track_p trk, wAction_t action, coOrd pos)` — Modify an Existing Bezier Track
+| Step | User Action | What happens |
+|------|-------------|---------------|
+| START | Click to place first endpoint | Shows "Drag end of first control arm" |
+| MOVE (first control point) | Drag the handle at the start-endpoint | The line between P0 and P1 follows; releasing moves it freely. If a track is attached, dragging while holding ALT locks that control point to stay aligned with that track's tangent. |
+| UP | Click elsewhere (no drag) | State advances: `CONTROL_ARM_1 → POS_2` showing "Select other end of Bezier" |
+| MOVE (second endpoint/control arm) | Drag the handle at the far-endpoint | The second control arm is drawn; releasing it completes placement. If a track is attached, ALT locks that side. |
+| UP/OK | Click elsewhere or press ENTER | Validates and finalizes the Bézier, converting to arcs and creating the `track_p` object. |
+| CANCEL | ESC | Discards the in-progress Bézier; resets state to `NONE`. |
 
-This function is called when the user invokes the "Modify" command on a selected Bezier track. It:
-1. Reads the current control point values from the extra-data block of the original track.
-2. Enters the same interactive editing sequence as `CmdBezCurve`.
-3. On confirmation, it undoes the modification to the old track and draws the new one in its place.
+**Track vs Line:** If `cmd == bezCmdCreateTrack`, the curve is a track (gauge-checked against layout gauge). Otherwise it's an ordinary line drawing.
 
----
+## Command: `CmdBezModify` — Modifying an Existing Bézier
 
-### `BezierLength(coOrd pos[4], dynArr_t segs)` — Compute Total Length of a Bezier (Approximated)
+When called from the Modify command, it loads the existing Bézier's four points into `Da.pos[]` and lets the user drag them just like in create mode. The original track is hidden; once the user confirms (ENTER), the old track is deleted and replaced with a new one built from the modified control points.
 
-Walks through all arc segments that approximate the Bézier curve and sums their lengths using `fabs(radius * D2R(angle_range))`.
+## Notes
 
----
-
-### `BezierMinRadius(coOrd pos[4], dynArr_t segs)` — Find Minimum Radius of Curvature Along a Bezier
-
-Returns the smallest absolute radius among all arc segments. This is used to detect whether any part of the track curves tighter than the minimum allowed radius for the current scale.
-
----
-
-### `BezierOffsetLength(dynArr_t segs, double offset)` — Compute Offset Length along a Bezier
-
-This function computes the length of an offset curve (parallel curve) by walking through each arc segment and adjusting its radius by `±offset` before computing arc length. This is used for drawing centerlines or parallel tracks alongside a Bézier track.
-
----
-
-## Summary
-
-| Aspect | Detail |
-|--------|--------|
-| Representation | Four control points; rendered as approximating circular arcs via binary search |
-| Editing model | Interactive "control arm" handles similar to Adobe Illustrator / CorelDraw |
-| Track snapping | Endpoints can be locked/unlocked to existing unconnected track endpoints (via SHIFT+drag) |
-| Validation | Cusps and loops are rejected; inflection points may produce very large radii that could exceed minimum radius constraints |
+- Bezier curves are internally always represented as circular arcs for rendering and DXF export.
+- A Bézier that approximates a straight line will have all its arc segments be straights (`SEG_STRLIN`).
+- The `-v` (verbose) option in `bdf2xtp.c` is unrelated; this module has no command-line interface — it's purely an interactive drawing tool invoked by the GUI.

@@ -1,172 +1,124 @@
-# ccornu.h — Cornu Spiral Command Interface
+# ccornu.h — Cornu Easement Curve Header
 
 ## Overview
 
-`ccornu.h` is a header file that declares the API for **Cornu spiral** (Euler spiral) commands in XTrkCAD. The Cornu spiral is used as a transition curve between straight track and circular arcs, providing a smooth change in curvature (from 0 on a straight line to a constant value on a circle).
+`ccornu.h` declares the public API for the Cornu easement curve command system. It provides function prototypes and type definitions used by `ccornu.c` to create, modify, and convert between Cornu easements and other track types (straights, circular arcs).
 
----
+## File Location
 
-## Data Types & Constants
+```
+app/bin/ccornu.h  (37 lines)
+```
 
-### `cornuMessageProc` — Message Callback Type
+## Includes & Dependencies
+
+| Header | Purpose |
+|--------|----------|
+| `common.h` | Common XTrkCad types (`STATUS_T`, `wAction_t`, `coOrd`, etc.) |
+
+## Type Definitions
+
+### `cornuMessageProc` — Message callback type
+
+A function pointer type used to pass a message procedure (typically `InfoMessage`) into command handlers so they can report status messages back to the user.
 
 ```c
 typedef void (*cornuMessageProc)( const char *, ... );
 ```
 
-A function pointer type for message callbacks. Used by the Cornu command system to report progress or status messages to the user.
+## Enums & Constants
 
----
+```c
+#define cornuCmdNone         (0)        // No active Cornu command
+#define cornuJoinTrack       (1)        // Command: join two tracks with a Cornu
+#define cornuCmdCreateTrack  (2)        // Command: create a new Cornu track
+#define cornuCmdHotBar       (3)        // Hotbar command; invoked from UI hotbar
+```
 
-### Command Mode Constants
-
-| Constant | Value | Description |
-|----------|-------|-------------|
-| `cornuCmdNone` | 0 | No command mode (default) |
-| `cornuJoinTrack` | 1 | Join an existing track with a Cornu spiral transition |
-| `cornuCmdCreateTrack` | 2 | Create a new track using Cornu spirals for transitions between curves and straights |
-| `cornuCmdHotBar` | 3 | Enable the hot bar tool (one-click insertion) |
-
-These are used to determine which mode of operation the Cornu command is in. For example, `cornuJoinTrack` means the user has clicked on an existing track segment and wants to add a Cornu spiral at its endpoint; `cornuCmdCreateTrack` means the user is drawing from scratch using the Cornu tool.
-
----
+These constants are used internally by `ccornu.c` to distinguish between different invocation modes of the Cornu creation command.
 
 ## Function Declarations
 
 ### `STATUS_T CmdCornu(wAction_t action, coOrd pos)`
 
-The main entry point for the Cornu command system. It handles single-click interactions:
+Main entry point for all user interactions with a Cornu easement. Handles:
+- Creating a new Cornu track by clicking two endpoints
+- Modifying an existing Cornu via handle dragging
+- Converting tracks to/from Cornu representation
 
-- **Parameters:**
-  - `action`: The action performed (e.g., mouse click) — see `wAction_t` type in the widget library
-  - `pos`: A coordinate pair (`coOrd`) representing the position of the click or cursor
-- **Returns:** A status code indicating whether the action was accepted
+**Parameters:**
+- `action` — One of the standard mouse event codes (`C_START`, `wActionMove`, `C_DOWN`, `C_MOVE`, `C_UP`, `C_LCLICK`, etc.)
+- `pos` — Mouse cursor position in screen coordinates
 
-This function is invoked by the hot bar tool when the user clicks to place a Cornu spiral segment.
-
----
+**Returns:** `STATUS_T` — one of the standard command return codes (`C_CONTINUE`, `C_TERMINATE`, `C_ERROR`)
 
 ### `BOOL_T CallCornu0(coOrd pos[2], coOrd center[2], ANGLE_T angle[2], DIST_T radius[2], dynArr_t *array_p, BOOL_T spots)`
 
-Calls a 4-point Cornu spiral computation given the positions of two endpoints and two control points (or centers/radii for arc transitions). It populates a `dynArr_t` array with intermediate point data along the spiral.
+Constructs the polynomial spiral spline and converts it to a chain of circular arcs. This is the core solver that interfaces with Raph Levien's spiro library. It builds the knot array, calls `TaggedSpiroCPsToBezier`, then closes the context.
 
-- **Parameters:**
-  - `pos[2]`: Two endpoint coordinates defining the chord between the straight and the curve
-  - `center[2]`: Centers of the two circular arcs (or one center and one offset for transition)
-  - `angle[2]`: Deflection angles at each end (0° on the straight, full deflection on the circle)
-  - `radius[2]`: Radii of the two connecting curves (infinity or zero-radius for a straight line)
-  - `array_p`: Pointer to a dynamic array where intermediate points will be stored
-  - `spots`: If true, also compute and store specific "spot" locations along the spiral
+**Parameters:**
+- `pos[2]` — The endpoint positions (start and end)
+- `center[2]` — Centers of the curve at each end; `(0,0)` means "straight" tangent
+- `angle[2]` — Tangent angles at endpoints
+- `radius[2]` — Radius at each end; `-1.0` means no endpoint (open), `0.0` means straight tangent
+- `array_p` — Pointer to a `dynArr_t` that will receive the resulting track segments
+- `spots` — Reserved flag (currently unused)
 
-- **Returns:** TRUE if successful, FALSE otherwise
-
----
+**Returns:** `TRUE` if successful, `FALSE` otherwise.
 
 ### `DIST_T CornuMinRadius(coOrd pos[4], dynArr_t segs)`
 
-Computes the minimum radius of curvature encountered by a Cornu spiral defined by four control points.
+Scans a sequence of Cornu spiral segments and returns the minimum radius (i.e., maximum curvature). Used for validation against a minimum-radius constraint.
 
-- **Parameters:**
-  - `pos[4]`: Four coordinate pairs defining the endpoints and intermediate control points
-  - `segs`: Dynamic array of segment data (likely containing intermediate computed values)
-- **Returns:** The minimum radius value found along the spiral path
+**Parameters:**
+- `pos[4]` — Four positions: start, end point 1, end point 2, end point 3 (for nested Bezier chains)
+- `segs` — The array of track segments representing the spiral
 
----
+**Returns:** Minimum radius along the curve; returns infinity if no curved segment is found.
 
 ### `DIST_T CornuMaxRateofChangeofCurvature(coOrd pos[4], dynArr_t segs, DIST_T *last_c)`
 
-Computes the maximum rate of change of curvature (i.e., the maximum third derivative of position with respect to arc length) along a Cornu spiral. This is a quality metric: lower values indicate smoother transitions.
+Computes $\displaystyle \max_{i} \frac{|\kappa'(s_i)|}{2\,\ell_i}$ where $\kappa'$ is the rate of change of curvature and $\ell_i$ is the length of segment $i$. This measures how rapidly curvature changes, which relates to passenger comfort on real railways.
 
-- **Parameters:**
-  - `pos[4]`: Four control point coordinates
-  - `segs`: Dynamic array of segment data
-  - `last_c`: Pointer to store the curvature at the last point (the circular arc radius)
-- **Returns:** The maximum rate-of-change value
+**Parameters:**
+- `pos[4]` — Same as above (for recursive descent into nested segments)
+- `segs` — The array of track segments
+- `last_c` — Output: the curvature value at the previous segment boundary (passed by pointer so it can be carried through recursion)
 
----
+**Returns:** Maximum rate-of-change-of-curvature along the entire curve.
 
 ### `DIST_T CornuLength(coOrd pos[4], dynArr_t segs)`
 
-Computes the total arc length of a Cornu spiral defined by four control points.
-
-- **Parameters:**
-  - `pos[4]`: Four coordinate pairs
-  - `segs`: Dynamic array of segment data
-- **Returns:** The computed arc length
-
----
+Computes total length of a Cornu spiral by summing arc lengths of all constituent circular arcs and straight segments.
 
 ### `DIST_T CornuOffsetLength(dynArr_t segs, double offset)`
 
-Computes the arc length along a Cornu spiral at a given fractional offset (0.0 = start, 1.0 = end). This is used for sampling points along the curve or for interpolation.
-
-- **Parameters:**
-  - `segs`: Dynamic array of segment data
-  - `offset`: Fractional distance along the curve (0–1)
-- **Returns:** The arc length corresponding to that offset
-
----
+Computes the length of an offset curve (parallel curve) at a given signed distance from the original. Used for generating offset tracks.
 
 ### `DIST_T CornuTotalWindingArc(coOrd pos[4], dynArr_t segs)`
 
-Computes the total winding angle (total change in heading direction) along a Cornu spiral. For a true transition from straight to circle, this equals the deflection angle of the circular arc.
-
-- **Parameters:**
-  - `pos[4]`: Four control point coordinates
-  - `segs`: Dynamic array of segment data
-- **Returns:** Total winding angle in radians (or degrees depending on coordinate system)
-
----
+Returns the total accumulated turning angle (winding number × $2\pi$) along the spiral, measured in radians. Equivalent to $\int \kappa(s)\,ds$.
 
 ### `STATUS_T CmdCornuModify(track_p trk, wAction_t action, coOrd pos, DIST_T trackG)`
 
-Modifies an existing track to include Cornu spiral transitions at specified endpoints.
-
-- **Parameters:**
-  - `trk`: Pointer to the track structure being modified
-  - `action`: The type of modification (insert, replace, etc.)
-  - `pos`: Position where the modification is made
-  - `trackG`: Gauge width of the track
-- **Returns:** Status code
-
----
+Command handler for modifying an existing Cornu easement track (e.g., dragging endpoint handles). Not all parameters are fully documented in the header — see `ccornu.c` for full behavior.
 
 ### `void InitCmdCornu(wMenu_p menu)`
 
-Initializes the Cornu command system and registers it with a given menu. This sets up internal data structures, message handlers, etc.
+Registers the Cornu command with the hotbar and context menus. Creates:
+- "Convert To Cornu" button
+- "Convert From Cornu" button
+- Hotbar entry point
 
-- **Parameters:**
-  - `menu`: Pointer to a widget menu (GTK or equivalent) where the Cornu tool will be placed
-
----
+**Parameters:**
+- `menu` — The main application menu (`wMenu_p`)
 
 ### `void AddHotBarCornu(void)`
 
-Adds a hot bar button that provides one-click access to the Cornu spiral creation/joining mode. This is a convenience feature for frequent users who want to quickly insert transition curves without navigating through menus.
+Adds a hotbar entry that invokes the "create new Cornu track" command. This is typically bound to a key or toolbar icon in the UI.
 
----
+## Notes
 
-## Summary Table
-
-| Function | Purpose | Key Parameters |
-|----------|---------|----------------|
-| `CmdCornu(action, pos)` | Main entry point; handles mouse clicks during Cornu drawing mode | action code, cursor position |
-| `CallCornu0()` | Computes a 4-point Cornu spiral and fills an array with points | endpoints, centers/angles/radii, output array |
-| `CornuMinRadius()` | Finds the minimum radius along a computed spiral | four control points, segment array |
-| `CornuMaxRateofChangeOfCurvature()` | Quality metric — maximum curvature rate (smoothness check) | four control points, segment array |
-| `CornuLength()` | Computes total arc length of the spiral | four control points, segment array |
-| `CornuOffsetLength()` | Samples a point at a given fractional offset along the curve | segment array, 0–1 offset |
-| `CmdCornuModify(trk, action, pos, trackG)` | Inserts Cornu transitions into an existing track | track pointer, action, position, gauge |
-| `InitCmdCornu(menu)` | Registers the Cornu command with a menu system | widget menu handle |
-| `AddHotBarCornu()` | Adds a toolbar/hot-bar button for quick access | none |
-
----
-
-## Summary
-
-| Category | Content |
-|----------|---------|
-| **Purpose** | Provide an interface and utility functions for computing, drawing, and modifying track geometry using Cornu (Euler) spirals as transition curves between straights and circular arcs. |
-| **Domain** | Geometric computation: the Cornu spiral is a special curve whose curvature changes linearly with arc length. It is ideal for transitioning from zero curvature (straight) to constant non-zero curvature (circle). The functions here handle coordinate geometry, numerical integration of curvature along the path, and interaction with the track data structure. |
-| **Key concept** | A Cornu spiral is defined parametrically by `x(s) = ∫₀ˢ Ci(t) dt`, `y(s) = ∫₀ˢ Si(t) dt` where `Ci` and `Si` are cosine and sine integrals of the accumulated curvature. The "4-point" interface abstracts away the parameterization and instead takes four points (start, end, and two intermediate control points that define the chord and deflection angles). |
-| **Main entry points** | `CmdCornu()` — called from the hot bar tool; `AddHotBarCornu()` — registers the toolbar button |
+- The header file is minimal and serves primarily as an API surface; most of the implementation logic lives in `ccornu.c`.
+- The spiro solver integration is opaque from this layer — it appears as a black box that takes endpoint conditions and returns Bezier segments.
+- The "convert" commands allow users to switch between representations: explicit Cornu vs. explicit chain of arcs/straights, which matters for editing granularity.

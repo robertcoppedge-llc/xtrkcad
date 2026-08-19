@@ -1,267 +1,182 @@
-# ccurve.c — Curved Track Creation Commands
+# ccurve.c — Curve Track Creation (Circular Arcs, Helices)
 
 ## Overview
 
-`ccurve.c` implements the interactive command system for creating curved track segments in XTrkCAD. It provides four distinct methods for defining an arc:
+`ccurve.c` implements interactive curve track creation tools that allow users to draw circular arc segments and helical spiral tracks. It provides three distinct "from-endpoint" modes for drawing curved tracks from a known endpoint:
+- **From End-Pt** — drag along the tangent direction at an existing endpoint
+- **From Tangent** — specify center location relative to the tangent at an endpoint
+- **From Center** — drag directly to define the radius (center is fixed)
 
-1. **From End-Point** (`crvCmdFromEP1`) — Click two endpoints; the curve is tangent to an existing track at one end.
-2. **From Tangent** (`crvCmdFromTangent`) — Click endpoint, then center point (tangent from endpoint).
-3. **From Center** (`crvCmdFromCenter`) — Click center of arc, then an endpoint on the chord.
-4. **From Chord** (`crvCmdFromChord`) — Click two endpoints defining a chord; the arc is tangent to both at those points.
+It also supports "from-chord" mode where a full circular arc is defined by two endpoints and the chord connecting them. Additionally, it implements circle creation from a fixed radius or via tangent/center clicks, and helix tracks for vertical spiral transitions between different elevations.
 
-Additionally, it implements:
-- `CmdBezCurve` / `CmdCornu` — Bezier and Cornu spiral curve creation (delegates to other modules)
-- **Helix track** (`CmdHelix`) — Creates helical tracks for tunnels or elevated sections with configurable vertical separation per turn
-- **Fixed-radius circle** (`CmdCircle`) — Creates a full circular arc of fixed radius
+## File Location
 
----
+```
+app/bin/ccurve.c  (1089 lines)
+```
 
-## Core Data Structures
+## Includes & Dependencies
 
-### `createState_e` — Command State Machine
+| Header | Purpose |
+|--------|----------|
+| `ccurve.h` | Local declarations (`curveData_t`, curve modes, etc.) |
+| `cjoin.h` / `cstraigh.h` | Track joining utilities and straight segment handling |
+| `cundo.h` | Undo/redo transaction support |
+| `custom.h` / `fileio.h` | Custom types, dynamic arrays, file I/O |
+| `cselect.h` | Selection management (`SetAllTrackSelect`, `SnapPos`) |
+| `param.h` | Parameter dialog system |
+| `track.h` | Track type definitions and creation routines |
+| `cbezier.h` / `ccornu.h` | Bezier and Cornu spiral utilities |
+
+## Key Concepts
+
+### Curve Creation Modes
+
+```text
++------------------+------------------------------------------+
+| Mode             | Description                                 |
++------------------+------------------------------------------+
+| From EP1         | Drag along tangent at endpoint to define  |
+|                   | arc direction; center is computed from     |
+|                   | chord perpendicular bisector.              |
++------------------+------------------------------------------+
+| From Tangent     | Click on desired center location           |
+|                   | relative to the endpoint's tangent         |
+|                   | direction.                                 |
++------------------+------------------------------------------+
+| From Center      | Click anywhere; distance from click        |
+|                   | becomes radius. Drag defines sweep angle.  |
++------------------+------------------------------------------+
+| From Chord       | Define two endpoints (chord) — the full   |
+|                   | circle is generated between them.          |
++------------------+------------------------------------------+
+```
+
+### Helix Tracks
+
+A helix track connects an endpoint at a lower elevation to an endpoint at a higher elevation via a circular arc in 3D space:
+- **Turns** — number of full vertical revolutions (integer)
+- **Angular Separation** — angle between start and end endpoints (degrees, 0–360°)
+- **Elevation Difference** — total height change (meters)
+- **Grade** — derived from the above as `elevation / (total arc length)`
+
+The helix is rendered as a circular arc with constant radius in model space.
+
+### State Machine States
 
 ```c
 typedef enum createState_e {
-    NOCURVE,        // No curve currently being created (waiting for first click)
-    FIRSTEND_DEF,   // First endpoint has been defined; waiting for second point
-    SECONDEND_DEF,  // Second endpoint defined; intermediate geometry computed
-    CENTER_DEF      // Center point has been locked in
+  NOCURVE,         // Not currently creating any curve
+  FIRSTEND_DEF,    // First endpoint defined; dragging second point
+  SECONDEND_DEF,   // Both endpoints defined; dragging control point for fit
+  CENTER_DEF       // Center and radius defined; awaiting final click
 } createState_e;
 ```
 
-This finite-state machine tracks the multi-step interactive drawing process. Each state corresponds to a specific "drag mode" shown in the info message (e.g., *"Drag from endpoint in direction of curve"*).
+## Data Structures
 
----
+### `struct { ... } Da` — Command State Machine
 
-### `Da` — Curve Drawing State Structure
+| Field | Type | Purpose |
+|-------|------|---------|
+| `state` | `STATE_T` | General command state (-1=off, 0=first end, 1=finalized) |
+| `create_state` | `createState_e` | Which step of curve creation are we in? |
+| `pos0` / `pos1` | `coOrd` | First and second endpoint coordinates |
+| `curveData_t curveData` | — | Computed arc geometry (center, radius, angles) |
+| `track_p trk` | pointer | The track object currently being created (if any) |
+| `EPINX_T ep` | int | Endpoint index on the neighbor track |
+| `down` | BOOL_T | Have we received a valid first click yet? |
+| `lock0` | BOOL_T | Is the start endpoint locked to an existing track endpoint? |
+| `middle` | `coOrd` | Midpoint of chord (for "from-chord" mode) |
 
-```c
-static struct {
-    createState_e create_state;   // Current step in the interactive process
-    coOrd pos0;                   // First control point (endpoint or center)
-    coOrd pos1;                   // Second control point (other endpoint, etc.)
-    curveData_t curveData;       // Computed arc data: center, radius, a0/a1 angles
-    track_p trk;                 // Optional: existing track being joined to
-    EPINX_T ep;                  // Endpoint index on `trk` for joining
-    BOOL_T down;                 // True after first mouse click (C_DOWN action)
-    BOOL_T lock0;                // Whether the first point was snapped to an endpoint
-    coOrd middle;                // Midpoint of chord (for chord-mode display)
-    coOrd end0, end1;            // Computed endpoints for visualization
-} Da;
-```
+### `struct helixData_s`
 
-This is a global/static structure that persists across mouse events (`C_START`, `C_DOWN`, `C_MOVE`, `C_UP`) until the command completes or cancels.
-
----
-
-### `tempSegs_da` — Temporary Segments Display Buffer
-
-A dynamic array of `trkSeg_t` structures used to render intermediate geometry (red arrows, anchor arcs) while the user is dragging. These are NOT part of the final track; they're only shown on screen until `C_UP` commits or cancels the creation.
-
----
-
-### `anchors_da` — Anchor Markers for Curved Track Creation
+Parameters for a helical track:
 
 ```c
-static dynArr_t anchors_da;  // Array of trkSeg_t used to draw "anchor" markers
+struct helixData_s {
+  long   turns;          // Number of full revolutions (e.g., 5)
+  ANGLE_T angSep;        // Angular separation between endpoints in degrees
+  DIST_T elev;           // Total elevation change
+  DIST_T radius;         // Radius of the circular projection
+  DIST_T grade;          // Derived: elev / (turns*2πR + chord_length) * 100%
+  DIST_T vertSep;       // Vertical separation per turn
+};
 ```
 
-Each anchor is a small arc (`SEG_CRVLIN`) drawn in blue around an endpoint. These indicate where the curve will connect to existing geometry or show possible join points. They are rendered during the drag but are not part of the final track definition.
+### `dynArr_t tempSegs_da` & `anchors_da`
 
----
-
-### `desired_radius` — User-Configured Default Radius
-
-```c
-static DIST_T desired_radius = 0.0;
-```
-
-A preference-storable value that acts as a default radius when creating curved tracks via the "curve from tangent" or similar modes. This allows power users to set a preferred curve radius and apply it repeatedly without re-entering the value each time.
-
----
+Temporary segment arrays used during interactive creation to hold preview geometry and anchor circles.
 
 ## Core Functions
 
-### `CreateCurve(action, pos, track, color, width, mode, anchor_array, message)` — Main Entry Point
+### `DrawArrowHeads(trkSeg_p sp, coOrd pos, ANGLE_T angle, BOOL_T bidirectional, wDrawColor color)`
 
-The central function dispatched from the command system. It handles all mouse actions (`C_START`, `C_DOWN`, `C_MOVE`, `C_UP`) and delegates to sub-modes via a `switch` on `action`.
+Draws small arrowheads at a given point along a track segment's tangent direction. Used to provide visual guidance during curve creation — red arrows show the valid direction of drag for the current mode. The function writes 1–5 `trkSeg_t` entries into an array depending on whether the arrow should be bidirectional (two-headed) or unidirectional.
 
-**Parameters:**
-- `track`: TRUE if drawing onto an existing track (joining), FALSE for free-form creation
-- `color`: Draw color for temporary segments (usually black)
-- `mode`: One of the four curve creation modes (`crvCmdFromEP1`, etc.)
-- `anchor_array`: Output pointer where anchor markers are accumulated
-- `message`: A callback function used to display info messages (e.g., `InfoMessage`)
+### `CreateEndAnchor(coOrd p, dynArr_t * anchor_array, wBool_t lock)`
 
-**Returns:** `C_CONTINUE` or `C_TERMINATE` (and optionally `C_ERROR`).
+Creates a small blue circle at point `p` that marks either:
+- A locked endpoint (filled black) — indicating that this point is constrained to an existing track's endpoint and cannot be moved freely.
+- An unlocked control handle (empty circle with outline) — the user can drag it to adjust the curve radius or direction.
 
----
+### `CreateCurve(wAction_t action, coOrd pos, BOOL_T track, ...)`
 
-### `DrawArrowHeads(sp, pos, angle, bidirectional, color)` — Draw Direction Indicators
+The main state machine for drawing a curved track segment. It handles:
+- **START** — reset internal arrays, show mode-appropriate message
+- **DOWN** — store first click; if snapping to track endpoint is enabled and ALT not held, snap to that endpoint and lock it via `CreateEndAnchor`. Set initial state.
+- **MOVE** — as the mouse moves: constrain motion along tangent/chord direction if locked, update preview segment geometry, show messages with current angle/radius/length values. Draw arrows pointing in valid drag directions.
+- **UP/CANCEL** — validate minimum length; compute final arc geometry; create track via `NewCurvedTrack()` or discard.
 
-Renders a small arrowhead centered at `pos`, pointing along `angle`. Used to show the "direction of curve" when dragging from an endpoint. The arrow is composed of 5 line segments forming a triangle/chevron shape.
+### `CmdCurve(wAction_t action, coOrd pos)` — Top-level command dispatcher
 
----
+Dispatches based on `curveMode` which is set by the menu choice (e.g., "Curve from End-Pt", "Curve from Tangent", etc.). Calls `CreateCurve()` internally and handles undo start/end around track creation.
 
-### `DrawArrowHeadsArray(anchor_array, pos, angle, bidirectional, color)` — Draw Multiple Arrows
+### `PlotCurve(...)` / `ConvertToArcs(...)`
 
-A convenience wrapper that appends new arrows to the `anchor_array` dynamic array and returns the count added (always 2 for bidirectional arrows). The actual drawing is delegated back to `DrawArrowHeads`.
+Internal helper functions that compute a circular arc between two endpoints given the current mode constraints, then convert it into a sequence of small straight/arc segments suitable for rendering by the general draw engine. The "from-chord" variant places the midpoint at the chord's center rather than on the track itself.
 
----
+### `CreateCurveFromChord(...)` / `CreateCurveFromTangent(...)` / `CreateCurveFixedRadius(...)`
 
-### `CreateEndAnchor(pos, anchor_array, lock)` — Create an Anchor Marker
+These are internal helper functions that compute a circular arc between two endpoints given different constraints (chord length, tangent direction, fixed radius). They are called from `PlotCurve()` and `CmdCircleCommon()`.
 
-Creates a small circular arc centered at `pos` with radius ≈ 7.5 units (15% of scale factor), used as a visual marker indicating where a curve endpoint is locked or could be placed. The anchor uses a full 360° arc (`a0=0`, `a1=360`) and is colored blue unless the point is locked (then red).
+### `CmdCircleFixedRadius(wAction_t action, coOrd pos)` / `CmdCircleFromTangent(...)` / `CmdCircleFromCenter(...)`
 
----
+Three modes for creating a full-circle track:
+- **Fixed Radius** — user enters radius in a dialog; clicking anywhere places that circle centered at the click point.
+- **From Tangent** — first click sets tangent direction, second click sets center location.
+- **From Center** — first click defines center, dragging to edge sets radius; second click finalizes.
 
-### `CmdCurve(action, pos)` — Curve Command Dispatcher
+All share a common implementation via `CmdCircleCommon()`.
 
-The public command function that users invoke via menu/hotbar. It sets up internal state variables and delegates to `CreateCurve` with a default color (`wDrawColorBlack`) and width (`0`).
+### `ComputeHelix(paramGroup_p pg, int h_inx, void *data)`
 
-**Modes registered in the menu:**
-- `"cmdCurveEndPt"` → joins existing track at endpoint 1
-- `"cmdCurveTangent"` → tangent-from-endpoint mode
-- `"cmdCurveCenter"` → center-point mode
-- `"cmdCurveChord"` → chord-between-two-points mode
+Callback invoked each time the helix dialog parameter changes. It recomputes derived values:
+- If turns and angular separation change → vertical separation per turn changes.
+- If elevation changes → total length or grade adjusts automatically.
+- The "Total Length" message field is updated to show the computed track length.
 
----
+### `CmdHelix(wAction_t action, coOrd pos)`
 
-### `CmdCircleCommon(action, pos, helix)` — Shared Circle/Helix Logic
+Similar state machine to curve creation but uses a helical arc that rises in elevation as it advances around its circle. On OK, calls `NewCurvedTrack()` with 0° start angle and a full turn count (e.g., 5 turns) and the derived end angle.
 
-Handles both fixed-radius circles (`CmdCircle`) and helix tracks (`CmdHelix`). The only difference is the `helix` flag:
-- If FALSE (circle): uses a simple radius value and creates a full 360° arc or partial arc
-- If TRUE (helix): uses a dialog-controlled radius, number of turns, angular separation, and grade
+## File Format (.xtp Export)
 
-**Circle modes:**
-- `"cmdCircleFixedRadius"` — user specifies a fixed radius in a preference field; draws an arc tangent to a selected endpoint
-- `"cmdCircleFromTangent"` — click on the edge (tangent point), then drag inward to define center
-- `"cmdCircleFromCenter"` — click on the center, then drag outward to define radius
+Circular arcs are serialized using the standard track segment format:
 
-**Helix parameters (via `helixPG` dialog):**
-| Field | Type | Description |
-|-------|------|-------------|
-| `elev` | float | Elevation difference from start to end of helix |
-| `radius` | float | Radius of the horizontal circle (≥ 1) |
-| `turns` | integer | Number of full turns around the helix axis |
-| `angSep` | float | Angular separation between consecutive turns (degrees, 0–360) |
-| `grade` | float | Grade percentage; if non-zero, radius is derived from elevation/turns instead |
-| `vertSep` | float | Vertical spacing per turn (computed automatically unless grade is set) |
+```text
+TURNOUT HO "My Curve"
+    P "Route1" 1 0
+    E -450.732 -1829.654 270.0
+    C -6000.0 0.0 0.0 0.0 360.0   ; center at origin, radius=-6000, full circle
+    T 0
+END_TURNOUT
+```
 
-The "Total Length" message field updates dynamically as parameters change.
+Helical tracks are exported by decomposing them into a sequence of small straight segments (along the helix) and arc segments that approximate the spiral's curvature in projection. Each segment is written as either `SEG_STRLIN` or `SEG_CRVTRK`.
 
----
+## Notes
 
-### `CmdCircle(action, pos)` — Circle Track Creation
-
-A thin wrapper around `CmdCircleCommon` with `helix=FALSE`. It uses either a fixed radius from preferences or computes the radius from two clicked points (center + tangent point).
-
-**Validation checks in `C_UP`:**
-- Radius must be > 0
-- Radius must not exceed map dimensions (`mapD.size.x`, `mapD.size.y`)
-- Radius must not exceed 10,000 units (prevents absurdly large circles)
-
----
-
-### `CmdHelix(action, pos)` — Helix Track Creation
-
-Identical to `CmdCircle` but with `helix=TRUE`. In addition to the usual radius checks, helix mode also requires:
-- Radius > 0
-- Number of turns ≥ 1
-- Total horizontal length (turns × circumference) must fit within map bounds
-
-The vertical geometry is computed from the elevation difference divided by total number of turns.
-
----
-
-### `ComputeHelix(pg, inx, data)` — Helix Parameter Update Handler
-
-Called every time a helix parameter control changes (elevation, radius, turns, angular separation, grade). It:
-1. Loads current values from all controls into `helixDataCur`
-2. Computes derived fields: total turns = integer turns + fractional turn from angular separation; vertical separation per turn; grade percentage if elevation is fixed
-3. Updates the "Total Length" message field
-4. Validates that the resulting helix fits on the map
-
-The function uses a clock-based ordering system (`h_orders`) to detect which fields need recomputation and propagate changes correctly (e.g., changing turns recalculates vertical separation; changing grade recalculates radius).
-
----
-
-### `InitCmdCurve(menu)` — Menu Initialization
-
-Registers all curve-related commands with the given menu. It creates button groups labeled "Curve Tracks" and "Circle Track", each containing one or more buttons that invoke the respective command functions. Icons are loaded from bitmaps (`.image3` includes) for:
-- Curved-end, curved-tangent, curved-middle, curved-chord
-- Bezier curve
-- Cornu spiral
-- Fixed-radius circle
-
-It also registers the `circleRadiusPG` param group so that its floating-point radius control is persisted to preferences.
-
----
-
-### `InitCmdHelix(menu)` — Helix Command Registration
-
-Adds a single pulldown menu item `"cmdHelix"` labeled "Helix" under which a sub-menu or dialog would appear (the code shows it uses a param dialog rather than icons). The helix dialog is created on first use (`C_START`).
-
----
-
-### `CmdBezCurve` / `CmdCornu` — Delegates to Other Modules
-
-These are stub command functions that delegate to external modules:
-- **Bezier** → `cbezier.c` (Bézier curve segments)
-- **Cornu** → `ccornu.c` (Euler spiral transition curves)
-
-They appear in the menu for consistency but their actual implementation lives elsewhere.
-
----
-
-## State Machine Flow — "Curve from End-Point" Mode
-
-This is the most interactive of all modes; here's how it progresses:
-
-1. **First click (`C_DOWN`) on an endpoint:**
-   - Snap to the nearest unconnected track endpoint if snapped mode is enabled and no key modifier is held
-   - If the snap succeeds, that point is "locked" (`lock0 = TRUE`); otherwise the user can still drag freely
-   - Show info message: *"End locked: Drag out curve start"* (if locked) or *"Drag along curve start"*
-   - Draw a blue arrow pointing in the tangent direction of the existing track
-
-2. **Dragging (`C_MOVE`) after first point is set:**
-   - If shift key held, the endpoint position is fixed; otherwise it follows the cursor
-   - Compute the chord between the two points and display an arc preview
-   - Show info message with current angle or radius depending on mode variant
-
-3. **Second click (`C_UP`):**
-   - Validate that both endpoints are separated by at least `minLength` (user preference, typically a few units)
-   - Create the curved track segment using `NewCurvedTrack()`
-   - If not shifted and an existing track was specified, connect the two tracks via `ConnectTracks()`
-   - Draw the new track with its endpoint graphics
-
-4. **Cancel:** Press ESC or click outside → reset state variables, clear temporary segments
-
----
-
-## Summary Table
-
-| Function | Purpose | Key Parameters |
-|----------|---------|----------------|
-| `DrawArrowHeads(sp, pos, angle, bidirectional, color)` | Draw a single arrowhead at a given position and orientation | segment pointer, coordinate, heading angle |
-| `DrawArrowHeadsArray(anchor_array, pos, angle, bidirectional, color)` | Append two arrowheads to the anchor array for display | dynamic array handle, position, angle |
-| `CreateEndAnchor(pos, anchor_array, lock)` | Create a small circular marker at a point; blue if free, red if locked | coordinate, output array, boolean flag |
-| `CreateCurve(action, pos, track, color, width, mode, anchor_array, message)` | Main curve-creation dispatcher for all four modes and Bezier/Cornu | action code, cursor position, boolean, color, width, mode enum, dynamic array, callback |
-| `CmdCurve(action, pos)` | Public command entry point; registers with menu system | action, coordinate |
-| `CmdCircleCommon(action, pos, helix)` | Shared logic for both fixed-radius circles and helices | action, coordinate, boolean flag |
-| `CmdCircle(action, pos)` | Create a full or partial circle track of fixed or computed radius | action, coordinate |
-| `CmdHelix(action, pos)` | Create a helical (spiral) track with configurable vertical separation | action, coordinate |
-| `ComputeHelix(pg, inx, data)` | Update helix geometry when any parameter changes; validate fit on map | param group pointer, control index, junk pointer |
-| `InitCmdCurve(menu)` | Register all curve-creation commands with a menu | menu handle |
-| `InitCmdHelix(menu)` | Register the helix command (uses a dialog instead of icons) | menu handle |
-
----
-
-## Summary
-
-| Category | Content |
-|----------|---------|
-| **Purpose** | Provide an interactive, mouse-driven interface for creating curved track segments using four different geometric definitions (endpoint, tangent, center, chord), plus helix and circle tracks. |
-| **Domain** | Interactive drawing: the code implements a state machine that translates a sequence of mouse clicks and drags into geometric primitives (arcs). It also handles validation (minimum length, map bounds) and integration with existing track segments via endpoint connection. |
-| **Key concept** | The `createState_e` enum drives a multi-step interactive process where each user action advances the state machine from "waiting for first point" → "first point locked" → "dragging second point" → "commit or cancel". Temporary geometry (arrows, anchor arcs) is rendered in a separate dynamic array (`tempSegs_da`) and never becomes part of the track database. |
-| **Main entry points** | `CmdCurve()` — invoked from menus/hotbar for creating curved tracks; `InitCmdCurve(menu)` — registers commands with the menu system |
+- All curve creation modes support undo/redo via `UndoStart()` / `UndoEnd()`.
+- The "from-chord" mode is useful when you want to define a circular arc by its chord endpoints rather than an endpoint and tangent direction.
+- Helix tracks are mathematically helical (constant slope) but rendered as piecewise arcs for compatibility with the general track drawing engine.

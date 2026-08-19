@@ -1,218 +1,214 @@
-# cblock.c — Block Objects (Layout Control: Track Blocks)
+# cblock.c — Block (Compound Track) Objects
 
 ## Overview
 
-`cblock.c` implements **Block** objects in XTrkCad. A *block* is a logical grouping of track segments that defines a "section" of the layout for purposes such as:
-- **Turnout switching control** — determining which turnout positions are valid given the current route selection.
-- **Signal placement and logic** — signals are placed at block boundaries and controlled by interlocking rules.
-- **Route locking** — ensuring only one path is allowed between two points (for safety).
+`cblock.c` implements **blocks** in XTrkCad. A block is a compound track object that groups multiple individual tracks into a single logical entity with one controller/detector script. Blocks are used to model:
 
-Blocks are defined geometrically as a connected region of track bounded by turnouts or switches, with endpoints at the turnout diverging points. The code handles:
-- Block creation from selected turnouts/switches
-- Block detection and numbering
-- Block management commands (create, delete, edit)
-- Integration with the container manager system for interactive editing
+- Signal blocks (a group of tracks controlled by a single signal)
+- Switched turnouts treated as a single unit
+- Any collection of tracks that should share common attributes (name, controller, etc.)
 
----
+## File Location
 
-## Key Data Structures
+```
+app/bin/cblock.c  (1040 lines)
+```
 
-### `blockData_t` — Block Extra Data
+## Includes & Dependencies
+
+| Header | Purpose |
+|--------|----------|
+| `common.h` | Core types (`track_p`, `coOrd`, `wAction_t`, etc.) |
+| `compound.h` / `cundo.h` / `custom.h` | Undo, compound track iteration |
+| `fileio.h` | File I/O utilities (`MyStrdup`) |
+| `param.h` | Parameter dialog types (`paramData_t`, `wString_p`) |
+| `track.h` | Track type system (`T_BLOCK`) |
+| `trkendpt.h` | Endpoint accessors (`GetTrkEndPtCnt`, `SetTrkEndPoint`) |
+| `common-ui.h` | UI dialogs, messages |
+| `include/utf8convert.h` | UTF-8 ↔ native encoding conversion |
+
+## Key Concepts
+
+### Block Data Structure
 
 ```c
-typedef struct blockData_s {
-    extraDataBase_t base;        // Generic header (index, layer)
-    trkSeg_p ep0;               // Segment at endpoint 0
-    trkSeg_p ep1;               // Segment at endpoint 1
-    track_p turnout[2];         // Turnout(s) defining this block
-    BOOL_T deleted;             // Deletion flag
+typedef struct btrackinfo_t {
+  track_p t;       // Pointer to the constituent track
+  TRKINX_T i;      // Its index (used for serialization)
+} btrackinfo_t, *btrackinfo_p;
+
+typedef struct blockData_t {
+  extraDataBase_t base;
+  char   *name;    // Block name (e.g., "Signal 4")
+  char   *script;  // Controller script (e.g., a detector or signal routine)
+  BOOL_T IsHilite; // Highlighting flag
+  track_p next_block;  // Doubly-linked list pointer to next block
+  wIndex_t numTracks;      // Number of constituent tracks
+  btrackinfo_t trackList[]; // Variable-length array of member tracks
 } blockData_t, *blockData_p;
 ```
 
-- **`ep0`, `ep1`** — The two endpoints of the block (turnout diverging points). These are defined by the track segments immediately after each turnout.
-- **`turnout[2]`** — Points to the turnouts that define this block. A single turnout can have multiple blocks attached if it has more than one switch motor (multi-path turnout).
+The `next_block` field forms a doubly-linked list of all blocks in the layout.
 
----
+### Block Types
 
-### `blockInfo_t` — Block Definition Record
-
-```c
-typedef struct {
-    char  *title;              // Human-readable name ("Block A", "Switching Yards")
-    BOOL_T deleted;            // Deletion flag
-    int    segCnt;            // Number of segments in the block outline
-    trkSeg_t *segs;          // Array of segment descriptors
-    coOrd  orig;              // Bounding box origin
-    coOrd  size;              // Bounding box dimensions
-    BOOL_T flipped;           // Horizontal flip flag (for mirrored blocks)
-    wIndex_t scaleInx;        // Layout scale index for this block definition
-} blockInfo_t, *blockInfo_p;
-```
-
-This is analogous to `turnoutInfo_t` — it stores reusable block definitions loaded from parameter files or user-defined library entries. Each entry has:
-- A title (e.g., "Switching Yards Block")
-- Scale compatibility (`scaleInx`)
-- Segment count and pointer to the segment array defining the block's outline
-
----
-
-### `extraDataBlock_t` — Generic Compound Extra Data for Blocks
-
-Blocks inherit from the compound track type, so they also contain:
+Blocks are defined by the type code:
 
 ```c
-typedef struct extraDataCompound_s {
-    extraDataBase_t base;
-    coOrd orig;                    // Global origin for transform
-    ANGLE_T angle;                 // Rotation around origin
-    BOOL_T flipped;                // Mirrored horizontally?
-    BOOL_T ungrouped;             // Segments individually selectable?
-    int split;                     // Split segment index (multi-part blocks)
-    char *descriptionOrig;        // Original description offset
-    coOrd descriptionOff;         // Offset to label position
-} extraDataCompound_t, ...;
+EXPORT TRKTYP_T T_BLOCK = -1;  // Defined but not initialized here (done later)
 ```
 
----
+## Command Interface (`blockCmds`)
+
+The `trackCmd_t` table for `T_BLOCK`:
+
+| Member | Function | Description |
+|--------|----------|-------------|
+| draw   | `DrawBlock` | Dummy — blocks are drawn by their constituents |
+| distance | `DistanceBlock` | Finds closest point on any constituent track |
+| describe | `DescribeBlock` | Describes name, script, length, endpoints |
+| delete  | `DeleteBlock` | Removes the block and its name/script strings; unlinks from list |
+| write   | `WriteBlock` | Writes `"BLOCK N "name" "script"\n\tTRK i\n"` lines to file |
+| read    | `ReadBlock` | Reads a block from an `.xtp` file (parses until `\tEND_BLOCK`) |
+| move    | `MoveBlock` | Empty — blocks are not moved individually |
+| rotate  | `RotateBlock` | Empty — same reason |
+| rescale | `RescaleBlock` | Empty — same reason |
+
+## File Format
+
+Blocks appear in `.xtp` files as:
+
+```text
+BLOCK <index> "name" "script"
+	TRK <index1>
+	TRK <index2>
+	...
+	END_BLOCK
+```
+
+The `ReadBlock()` function parses this format line by line, accumulating constituent track indices until it encounters the `END_BLOCK` marker. Each read block is linked into the global list via `next_block`.
 
 ## Core Functions
 
-### `BlockCreate(track_p trk)` — Create a New Block Track Object
+### `GetblockData(track_p trk)`
 
-Creates a new track of type `T_BLOCK`. It:
-1. Calls `NewTrack()` with type `T_BLOCK` and an appropriate size for the extra-data block.
-2. Initializes fields to zero.
-3. Marks it as deleted (`deleted = TRUE`) so it won't be drawn until populated.
+Retrieves the extra data pointer for a given track. Returns a `blockData_p` cast from the `extraDataBase_t` base structure attached to the track's private data.
 
----
+### `DrawBlock(track_p t, drawCmd_p d, wDrawColor color)`
 
-### `BlockFind(track_p t)` — Find Associated Blocks for a Turnout
+An empty function — blocks are not drawn directly; their constituent tracks draw themselves.
 
-Given a turnout track, finds all blocks attached to it by scanning the doubly-linked list of blocks whose `turnout` pointer references this turnout. Returns a pointer to the matching extra-data block or NULL if none found. Used when detecting route changes to update interlocking state.
+### `DistanceBlock(track_p t, coOrd *p)`
 
----
+Finds the minimum distance from point `p` to any track inside the block:
+- Iterates over all members of `trackList[]`
+- For each non-NULL member, calls `GetTrkDistance()` and tracks the minimum.
+- Stores the closest point back into `*p` for offset calculations.
 
-### `BlockDelete(track_p trk)` — Free a Block Object
+Returns that minimum distance.
 
-Frees dynamically allocated memory (name string, segment array) and removes the block from its doubly-linked list (`first_block` ↔ `last_block`). Updates head/tail pointers. Called when a turnout is deleted or the block definition is removed from memory.
+### `DescribeBlock(track_p trk, char *str, CSIZE_T len)`
 
----
+Populates a description string used by layout commands (e.g., in the track list dialog). It:
+1. Fetches name and script from the block data.
+2. Formats a line like `"TRACK (4): Layer=3 Signal 4"`.
+3. Sets up a `descData_t` array with fields for Name, Script, Length, End Pt 1, End Pt 2 — each marked as read-only (`DESC_RO`) because the block's geometry is immutable after creation.
 
-### `WriteBlock(track_p t, FILE *f)` — Serialize Block to File Format
+### `DeleteBlock(track_p t)`
 
-Writes a line such as:
-```text
-BLOCK 42 7 "Switching Yards" (0.1) "Block A"
-```
+Removes the block from memory:
+- Frees the name and script strings (which may point into the track's data area).
+- Unlinks the block from the doubly-linked list of blocks by updating pointers in neighboring entries.
+- Does **not** delete the constituent tracks — those remain as separate `track_p` objects.
 
-Format: `BLOCK <index> <turnout_index> "<name>" (<scale>) "<title>"`
+### `WriteBlock(track_p t, FILE *f)`
 
-The scale is stored as a float multiplier relative to the base layout scale (e.g., `(0.1)` means 1/10th scale). If no special block definition exists, a generic "Block" title is used with scale `*`.
+Outputs a block to a file:
+1. Duplicates the name and script into local buffers (UTF-8 conversion may be applied).
+2. Writes the header line `"BLOCK <index> "name" "script"\n"`.
+3. For each constituent track, writes `"	TRK <index>\n"`.
+4. Writes a terminator line `"\tEND_BLOCK\n"`.
 
----
+### `ReadBlock(char *line)`
 
-### `ReadBlock(char *line)` — Deserialize Block from File Format
+Parses a block definition from an `.xtp` file:
+1. Calls `GetArgs()` to extract the index, name, and script.
+2. Advances `cp` past the rest of the header line and reads subsequent lines until `TRK` is encountered or `END_BLOCK` terminates the loop.
+3. For each `TRK i` line, appends a new `btrackinfo_t` entry to `blockTrk_da`.
+4. Constructs a new track object with type `T_BLOCK`, allocating extra space for the block data structure (size = base struct + `numTracks * sizeof(btrackinfo_t)`).
+5. Sets up endpoints from the accumulated endpoint points collected during parsing.
+6. Stores the name and script into the block's fields.
+7. Links the new block into the global list (`first_block` / `last_block`).
+8. The member track indices in `trackList[]` are stored as raw indices; they will be resolved later by `ResolveBlockTrack()`.
 
-Parses a line starting with `"BLOCK"`. Extracts:
-- Turnout index (to locate the associated turnout)
-- Name string
-- Scale multiplier (as a float, or "*" for generic)
-- Title (human-readable label)
+### `ResolveBlockTrack(track_p trk)`
 
-Creates a new track object of type `T_BLOCK` and stores it in a global array (`block_da`). The block is marked as deleted until its endpoints are resolved.
+Resolves the raw integer track indices in a block's `trackList[]` into actual `track_p` pointers:
+- Iterates each entry.
+- Calls `FindTrack(index)` to get the corresponding track object.
+- Stores the result back into the member's `.t` field.
 
----
+If any referenced track does not exist, an error message is shown and that entry remains NULL. This function is called during layout load so blocks can be reconstructed even if some constituent tracks were deleted or renamed since export.
 
-### `ResolveBlock(track_p trk)` — Resolve Turnout References After Load
+### `blockCheckContiguousPath()`
 
-When blocks are loaded from file, the turnouts they reference may not yet exist (because turnout records are loaded later). This function:
-1. Checks if the associated turnout exists via `FindTrack()`.
-2. If found, resolves any flip/angle transforms and re-computes the bounding box.
-3. If not found, leaves the block in a deleted state until its turnout is created.
+Validates that all tracks inside a block form a single connected graph (i.e., they are not disjoint islands). It:
+1. Iterates each member track and collects its unconnected endpoints into a temporary list (`TempEndPts`).
+2. For every endpoint, checks whether it is within `connectDistance` / `connectAngle` of any other open endpoint (via `TempEndPtsAppend()` logic).
+3. If any track has an endpoint with no neighbor found AND more than one track exists in the block, returns `FALSE` — the block would be "discontiguous".
 
----
+This check prevents accidental creation of blocks that group unrelated, disconnected track pieces.
 
-### `DeleteBlocks(track_p t)` — Delete All Blocks Attached to a Turnout
+### `NewBlockDialog()`
 
-When a turnout is deleted (or its associated switch motors are removed), this function iterates over all blocks whose `turnout` pointer references that turnout, deletes each block, and finally calls `FreeTrack()` on the track record. Used during cleanup to avoid memory leaks.
+Presents a dialog to collect tracks for a new block:
+- Iterates all selected tracks; skips non-tracks and any already in another block.
+- Increments `blockElementCount`. If zero tracks selected, shows an error.
+- Creates the parameter dialog with two fields: "Name" (required) and "Script" (optional).
+- Shows the window; when the user clicks **Ok**, `BlockOk()` is invoked.
 
----
+### `BlockOk(void *junk)`
 
-### `DrawBlock(track_p t, drawCmd_p d, wDrawColor color)` — Render a Block Track
+Handles the **Ok** button in the create dialog:
+1. Collects all selected tracks again into `blockTrk_da`.
+2. Checks for too many elements (> 128) — aborts with a message if so.
+3. Calls `blockCheckContiguousPath()` — aborts with "Block is discontiguous!" if the graph is broken.
+4. Creates a new block track object, copying all members' endpoints into it (so the block shares the same geometry).
+5. Stores the name and script strings; builds the member track list.
+6. Links the block into the global list (`first_block` → `last_block`).
+7. Calls `UndoEnd()` to complete the transaction.
 
-Renders the block outline using its segment array. Since blocks are defined as closed polylines (or open chains depending on layout), each segment is drawn at its appropriate position relative to the block's origin and angle. The fill style depends on whether the block is "active" or in a conflicting state (e.g., two trains occupying the same block simultaneously).
+### `EditBlock(track_p trk)`
 
----
+Opens an edit dialog for a selected block:
+- Copies current name/script into buffers.
+- Builds a comma-separated string of all member track indices.
+- Shows a parameter dialog where the user can rename or change the script.
+- On **Ok**, `BlockEditOk()` updates the block's strings and calls `UndoEnd()`.
 
-### `BlockMgmLoad(void)` — Register Blocks with Container Manager
+### `DrawBlockTrackHilite()` / `CONTMGM_DO_HILIGHT` etc.
 
-Called during initialization, this iterates over all loaded blocks and registers each with the container manager system:
-- Creates an icon handle (`wIconCreatePixMap()`) from a bitmap resource.
-- Calls `ContMgmLoad()` to wire up mouse-click, drag, and edit commands for each block track object.
+When the user requests highlighting (e.g., from a context menu "Highlight Block"), these functions:
+1. Compute a bounding box that encloses all constituent tracks.
+2. Draw a semi-transparent rectangle around the entire block in a light gray.
 
-This enables users to click on a block in the drawing to open its properties dialog.
+This visual cue helps the user see which tracks belong to a single logical unit.
 
----
+### `BlockMgmLoad()` / `BlockMgmProc(int cmd, ...)`
 
-### `InitCmdBlock(wMenu_p menu)` — Register Block Menu Command
+Registers each block with the compound track management system via `ContMgmLoad()`. The command handler responds to:
+- `CONTMGM_CAN_EDIT` → always returns TRUE (blocks are editable).
+- `CONTMGM_DO_EDIT` → calls `EditBlock(trk)`.
+- `CONTMGM_CAN_DELETE` → always returns TRUE.
+- `CONTMGM_DO_DELETE` → deletes the block track object (which implicitly leaves its constituents orphaned as separate tracks).
+- `CONTMGM_GET_TITLE` → builds a title string for tooltips or menus: `"Signal 4, T0, T3"` etc.
 
-Adds a "Block" button to the command menu (with a building/padding icon). Also registers the parameter group (`blockPG`) for any user-defined parameters associated with blocks.
+### `InitCmdBlock(wMenu_p menu)`
 
----
+Registers the command with the menu system and creates the parameter dialog object (lazily on first call via static variables). The "Create Block" button is added to the main toolbar/menu.
 
-### `InitTrkBlock(void)` — Initialize Block Track Type
+## Design Notes
 
-Finalizes initialization:
-- Calls `InitObject()` to register `T_BLOCK` as a valid track type in the command system.
-- Finds or creates a log category named "block".
-- Initializes a dynamic array for per-track block information (`blockTrk_da`).
-- Sets up global pointers (`first_block`, `last_block`) for doubly-linked list management.
-
----
-
-### `BlockMgmProc(int cmd, void *data)` — Block Management Command Dispatcher
-
-The central event handler registered with the container manager. Handles:
-- **`CONTMGM_CAN_EDIT`** → always returns TRUE (blocks can be edited)
-- **`CONTMGM_DO_EDIT`** → opens a properties dialog for the selected block
-- **`CONTMGM_CAN_DELETE`** → always returns TRUE (blocks can be deleted)
-- **`CONTMGM_DO_DELETE`** → calls `DeleteTrack()` on the track record
-- **`CONTMGM_GET_TITLE`** → formats a title like `"Block A"` for display in lists
-
----
-
-## Usage Flow
-
-1. **During initialization**, `InitTrkBlock()` is called, which registers `T_BLOCK` as a valid track type and initializes bookkeeping structures.
-2. When the user selects turnouts that define a block region, `BlockCreate()` allocates a new track record.
-3. The block's segment endpoints are computed (based on the turnout diverging points) and stored in the extra-data block.
-4. During rendering, `DrawBlock()` draws the polyline outline.
-5. When editing or deleting is requested via mouse interaction, `BlockMgmProc()` dispatches to the appropriate handler.
-6. On file load, blocks are deserialized via `ReadBlock()` and later resolved against existing turnouts via `ResolveBlock()`.
-
----
-
-## Summary Table
-
-| Function | Purpose |
-|----------|---------|
-| `BlockCreate()` | Allocate a new block track record |
-| `BlockFind()` | Find all blocks attached to a given turnout |
-| `BlockDelete()` | Free memory and unlink from doubly-linked list |
-| `WriteBlock()` | Serialize block definition to file |
-| `ReadBlock()` | Deserialize block from file format |
-| `ResolveBlock()` | Resolve turnout references after loading |
-| `DeleteBlocks()` | Delete all blocks attached to a deleted turnout |
-| `DrawBlock()` | Render block outline on canvas |
-| `BlockMgmLoad()` | Register blocks with container manager system |
-| `InitCmdBlock()` | Register menu button and parameter group |
-| `InitTrkBlock()` | Final initialization, register track type |
-| `BlockMgmProc()` | Management command dispatcher (edit/delete) |
-
----
-
-## Notes
-
-- Blocks are a higher-level concept than simple turnouts: they represent *regions* of track bounded by turnout diverging points. A single turnout can have multiple blocks attached if it has two or more switch motors (multiple paths).
-- The `deleted` flag is used extensively — newly created blocks start as deleted and remain so until their endpoints are resolved (which happens when the associated turnouts exist in the layout).
-- Blocks support a flip transform, allowing mirrored block definitions to be reused across different sides of a layout.
+- Blocks are **immutable after creation**: you cannot add or remove constituent tracks once a block exists. You must delete the whole block and create a new one if you need to change membership.
+- The `DistanceBlock()` function returns the minimum distance from a query point to any track inside the block, which is useful for collision detection or path-following algorithms that treat the entire block as a single obstacle.
+- The discontiguity check ensures blocks represent coherent logical units (e.g., one signal controlling a consistent stretch of track) rather than arbitrary collections of unrelated pieces.

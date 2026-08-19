@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `app/cornu/` directory contains a port of Raph Levien's **polynomial spiral spline** library, used by XTrkCad to generate smooth easement curves between track segments. Unlike traditional clothoid (Cornu) functions which use Fresnel integrals for linearly-varying curvature, the spiro library uses piecewise polynomial spirals with $C^2$ continuity.
+The `app/cornu/` directory contains a port of **Raph Levien's polynomial spiral spline** library, used by XTrkCad to generate smooth easement curves between track segments. Unlike traditional clothoid (Cornu) functions which use Fresnel integrals for linearly-varying curvature, the spiro library uses piecewise polynomial spirals with $C^2$ continuity.
 
 ---
 
@@ -11,6 +11,7 @@ The `app/cornu/` directory contains a port of Raph Levien's **polynomial spiral 
 | File | Summary |
 |------|---------|
 | [`spiro.c`](./spiro.c.md) | Polynomial spiral splines: band-diagonal matrix solver, Newton iteration for coefficient determination, subdivision to Bezier paths |
+| [`spiroentrypoints.c`](./spiroentrypoints.c.md) | XTrkCad integration layer: initializes spiro objects, generates easement curves from track database segments, handles spline continuity constraints |
 
 ---
 
